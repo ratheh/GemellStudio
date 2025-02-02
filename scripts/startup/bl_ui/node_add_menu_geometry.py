@@ -7,7 +7,16 @@ from bl_ui import node_add_menu
 from bpy.app.translations import (
     contexts as i18n_contexts,
 )
+from bpy.types import Menu
 
+class NODE_MT_geometry_node_GEO_GEMELL(Menu):
+    bl_idname = "NODE_MT_geometry_node_GEO_GEMELL"
+    bl_label = "Gemell"
+
+    def draw(self, _context):
+        layout = self.layout
+        node_add_menu.add_node_type(layout, "GeometryNodeGemellYarn")
+        node_add_menu.draw_assets_for_catalog(layout, self.bl_label)
 
 class NODE_MT_gn_attribute_base(node_add_menu.NodeMenu):
     bl_label = "Attribute"
@@ -989,6 +998,8 @@ class NODE_MT_gn_all_base(node_add_menu.NodeMenu):
     def draw(self, context):
         del context
         layout = self.layout
+        layout.menu("NODE_MT_geometry_node_GEO_GEMELL")
+        layout.separator()
         self.draw_menu(layout, "Input")
         self.draw_menu(layout, "Output")
         layout.separator()
@@ -1147,6 +1158,7 @@ swap_menus = node_add_menu.generate_menus(
 
 
 classes = (
+    NODE_MT_geometry_node_GEO_GEMELL,
     *add_menus,
     *swap_menus,
 )
