@@ -65,6 +65,7 @@
 #include "BKE_main.hh"
 #include "BKE_node.hh"
 #include "BKE_node_enum.hh"
+#include "BKE_node_external_service.hh"
 #include "BKE_node_legacy_types.hh"
 #include "BKE_node_runtime.hh"
 #include "BKE_node_tree_interface.hh"
@@ -5428,10 +5429,18 @@ void node_type_storage(bNodeType &ntype,
 void node_system_init()
 {
   register_nodes();
+
+  /* Initialize external node services */
+  ExternalNodeServiceManager &manager = ExternalNodeServiceManager::get_instance();
+  manager.discover_and_initialize();
 }
 
 void node_system_exit()
 {
+  /* Cleanup external node services */
+  ExternalNodeServiceManager &manager = ExternalNodeServiceManager::get_instance();
+  manager.cleanup();
+
   get_node_type_alias_map().clear();
 
   const Vector<bNodeType *> node_types = get_node_type_map().extract_vector();

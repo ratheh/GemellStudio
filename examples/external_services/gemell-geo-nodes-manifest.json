@@ -1,0 +1,45 @@
+{
+  "manifest_version": "1.0",
+  "service": {
+    "id": "gemell.geo.nodes",
+    "name": "Gemell Geo Nodes",
+    "version": "1.0.0",
+    "description": "External geometry nodes service example",
+    "vendor": "Your Company Name"
+  },
+  "installation": {
+    "install_root": "D:/Program Files/FabricDataLoaderAPI",
+    "executable_path": "D:/Program Files/FabricDataLoaderAPI/bin/FabricDataLoaderAPI.exe",
+    "working_directory": "D:/Program Files/FabricDataLoaderAPI"
+  },
+  "service_config": {
+    "executable": {
+      "args": [
+        "--mode",
+        "blender-node-service",
+        "--port",
+        "{port}"
+      ]
+    },
+    "api": {
+      "protocol": "http",
+      "host": "127.0.0.1",
+      "port": 0,
+      "base_path": "/api/v1/geonodes",
+      "startup_timeout_ms": 10000,
+      "health_check_endpoint": "/health"
+    },
+    "node_collection": {
+      "menu_name": "Gemell Geo Nodes",
+      "icon": "OUTLINER_OB_CURVES",
+      "description": "External geometry nodes from Gemell service"
+    },
+    "shared_memory": {
+      "format": "apache_arrow",
+      "alignment": 64
+    },
+    "auto_start": 0,
+    "restart_on_failure": 1,
+    "max_restart_attempts": 3
+  }
+}
