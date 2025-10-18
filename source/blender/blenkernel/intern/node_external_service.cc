@@ -9,6 +9,7 @@
  */
 
 #include "BKE_node_external_service.hh"
+#include "BKE_gem_external_service_process.hh"
 
 #include <ctime>
 #include <filesystem>
@@ -79,11 +80,17 @@ void ExternalNodeServiceManager::discover_and_initialize()
   }
 
   CLOG_INFO(&LOG, "Loaded %d external service(s)", int(services_.size()));
+
+  /* Auto-start services if configured (delegates to process helper) */
+  external_service_auto_start_all(services_);
 }
 
 void ExternalNodeServiceManager::cleanup()
 {
-  /* Cleanup: Shutdown running services, release resources */
+  /* Shutdown all running services (delegates to process helper) */
+  external_service_shutdown_all(services_);
+
+  /* Release resources */
   services_.clear();
   service_map_.clear();
   service_ptr_cache_.clear();
@@ -367,17 +374,32 @@ bool ExternalNodeServiceManager::parse_manifest_from_json(
   /* Parse lifecycle flags */
   const io::serialize::DictionaryValue *root_config = config_dict;
 
-  /* Note: lookup_int returns optional<int64_t>, need to handle booleans specially */
-  /* For now, assume these fields might be integers (0/1) or missing */
+  /* Default values */
   manifest.auto_start = false;
   manifest.restart_on_failure = false;
   manifest.max_restart_attempts = 3;
 
-  if (auto auto_start = root_config->lookup_int("auto_start")) {
-    manifest.auto_start = (*auto_start != 0);
+  /* Helper lambda to read boolean from either int (0/1) or boolean (true/false) */
+  auto lookup_bool = [](const io::serialize::DictionaryValue *dict,
+                        const char *key) -> std::optional<bool> {
+    /* Try to lookup as integer first (for backward compatibility with 0/1) */
+    if (auto int_val = dict->lookup_int(key)) {
+      return *int_val != 0;
+    }
+    /* Try to lookup as boolean (for true/false) */
+    if (const std::shared_ptr<io::serialize::Value> *value = dict->lookup(key)) {
+      if (const io::serialize::BooleanValue *bool_val = (*value)->as_boolean_value()) {
+        return bool_val->value();
+      }
+    }
+    return std::nullopt;
+  };
+
+  if (auto auto_start = lookup_bool(root_config, "auto_start")) {
+    manifest.auto_start = *auto_start;
   }
-  if (auto restart = root_config->lookup_int("restart_on_failure")) {
-    manifest.restart_on_failure = (*restart != 0);
+  if (auto restart = lookup_bool(root_config, "restart_on_failure")) {
+    manifest.restart_on_failure = *restart;
   }
   if (auto max_attempts = root_config->lookup_int("max_restart_attempts")) {
     manifest.max_restart_attempts = int(*max_attempts);
@@ -412,6 +434,32 @@ bool ExternalNodeServiceManager::validate_manifest(const ExternalServiceManifest
   }
 
   return true;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Service Lifecycle Management (Delegates to node_external_service_process.cc)
+ * \{ */
+
+bool ExternalNodeServiceManager::launch_service(ExternalNodeService &service)
+{
+  return external_service_launch(service);
+}
+
+bool ExternalNodeServiceManager::shutdown_service(ExternalNodeService &service)
+{
+  return external_service_shutdown(service);
+}
+
+void ExternalNodeServiceManager::shutdown_all_services()
+{
+  external_service_shutdown_all(services_);
+}
+
+void ExternalNodeServiceManager::check_service_health()
+{
+  external_service_check_health(services_);
 }
 
 /** \} */
