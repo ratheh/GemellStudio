@@ -30,6 +30,8 @@ set(SRC
   intern/BLI_ghash_utils.cc
   intern/BLI_heap.cc
   intern/BLI_heap_simple.cc
+  intern/gem_http_client_unix.cc
+  intern/gem_http_client_win.cc
   intern/BLI_kdopbvh.cc
   intern/BLI_linklist.cc
   intern/BLI_linklist_lockfree.cc
@@ -130,6 +132,8 @@ set(SRC
   intern/path_utils.cc
   intern/polyfill_2d.cc
   intern/polyfill_2d_beautify.cc
+  intern/gem_process_unix.cc
+  intern/gem_process_win.cc
   intern/quadric.cc
   intern/radial_tiling_shared.cc
   intern/rand.cc
@@ -262,6 +266,7 @@ set(SRC
   BLI_hash_tables.hh
   BLI_heap.h
   BLI_heap_simple.h
+  BLI_gem_http_client.hh
   BLI_implicit_sharing.h
   BLI_implicit_sharing.hh
   BLI_implicit_sharing_ptr.hh
@@ -354,6 +359,7 @@ set(SRC
   BLI_polyfill_2d_beautify.h
   BLI_pool.hh
   BLI_probing_strategies.hh
+  BLI_gem_process.hh
   BLI_quadric.h
   BLI_radial_tiling.hh
   BLI_rand.h
@@ -483,6 +489,7 @@ if(WIN32)
     bf_intern_uriconvert
     bf_intern_utfconv
     dxgi
+    winhttp
   )
   list(APPEND SRC
     intern/system_win32.cc

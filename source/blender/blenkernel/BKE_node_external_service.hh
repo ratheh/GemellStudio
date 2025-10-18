@@ -141,6 +141,30 @@ class ExternalNodeServiceManager {
    */
   ExternalNodeService *find_service(StringRef service_id) const;
 
+  /**
+   * Launch an external service process.
+   * (Delegates to external_service_launch in node_external_service_process.cc)
+   */
+  bool launch_service(ExternalNodeService &service);
+
+  /**
+   * Shutdown an external service process.
+   * (Delegates to external_service_shutdown in node_external_service_process.cc)
+   */
+  bool shutdown_service(ExternalNodeService &service);
+
+  /**
+   * Shutdown all running services.
+   * (Delegates to external_service_shutdown_all in node_external_service_process.cc)
+   */
+  void shutdown_all_services();
+
+  /**
+   * Check health of all running services and restart if needed.
+   * (Delegates to external_service_check_health in node_external_service_process.cc)
+   */
+  void check_service_health();
+
  private:
   ExternalNodeServiceManager() = default;
   ~ExternalNodeServiceManager() = default;

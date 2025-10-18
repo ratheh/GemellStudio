@@ -232,6 +232,7 @@ set(SRC
   intern/node.cc
   intern/node_enum_definition.cc
   intern/node_external_service.cc
+  intern/gem_external_service_process.cc
   intern/node_runtime.cc
   intern/node_socket_value.cc
   intern/node_tree_dot_export.cc
@@ -474,6 +475,7 @@ set(SRC
   BKE_node.hh
   BKE_node_enum.hh
   BKE_node_external_service.hh
+  BKE_gem_external_service_process.hh
   BKE_node_legacy_types.hh
   BKE_node_runtime.hh
   BKE_node_socket_value.hh
