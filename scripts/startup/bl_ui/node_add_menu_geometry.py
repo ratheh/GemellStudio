@@ -9,14 +9,14 @@ from bpy.app.translations import (
 )
 from bpy.types import Menu
 
-class NODE_MT_geometry_node_GEO_GEMELL(Menu):
+class NODE_MT_geometry_node_GEO_GEMELL(node_add_menu.AddNodeMenu):
     bl_idname = "NODE_MT_geometry_node_GEO_GEMELL"
     bl_label = "Gemell"
 
     def draw(self, _context):
         layout = self.layout
-        node_add_menu.add_node_type(layout, "GeometryNodeGemellYarn")
-        node_add_menu.draw_assets_for_catalog(layout, self.bl_label)
+        self.node_operator(layout, "GeometryNodeGemellYarn")
+        self.draw_assets_for_catalog(layout, self.bl_label)
 
 class NODE_MT_gn_attribute_base(node_add_menu.NodeMenu):
     bl_label = "Attribute"
