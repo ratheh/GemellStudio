@@ -107,6 +107,17 @@ void external_service_check_health(Vector<std::unique_ptr<ExternalNodeService>> 
 bool external_service_wait_for_health(ExternalNodeService &service);
 
 /**
+ * Query available geometry nodes from external service.
+ *
+ * Makes HTTP GET request to node discovery endpoint (api_base_url).
+ * Parses JSON response and populates service.nodes vector.
+ *
+ * \param service: Service to query
+ * \return true if nodes were successfully queried and parsed, false otherwise
+ */
+bool external_service_query_nodes(ExternalNodeService &service);
+
+/**
  * Substitute variables in launch arguments.
  *
  * Replaces:

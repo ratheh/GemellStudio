@@ -82,6 +82,58 @@ struct ExternalServiceManifest {
 };
 
 /**
+ * Socket definition for an external node.
+ * Describes input or output socket metadata from external service.
+ */
+struct ExternalNodeSocket {
+  std::string name;
+  std::string description;
+  int socket_type;  /* eNodeSocketDatatype (SOCK_GEOMETRY, SOCK_STRING, etc.) */
+  int subtype;      /* Socket subtype flags (e.g., for FILE_PATH) */
+
+  /* Constraints */
+  bool required;
+  std::optional<float> min_value;
+  std::optional<float> max_value;
+
+  /* Default values (variant based on type) */
+  std::string default_string_value;
+  int default_int_value;
+  float default_float_value;
+  bool default_bool_value;
+
+  ExternalNodeSocket()
+      : socket_type(0),
+        subtype(0),
+        required(false),
+        default_int_value(0),
+        default_float_value(0.0f),
+        default_bool_value(false)
+  {
+  }
+};
+
+/**
+ * Node definition from external service.
+ * Contains all metadata needed to register a node in Blender.
+ */
+struct ExternalNodeDefinition {
+  std::string node_id;   /* Unique identifier (e.g., "gemell.yarn.generate_from_curve") */
+  std::string name;      /* Display name (e.g., "Yarn Generator") */
+  std::string description;
+  std::string category; /* Category hint (e.g., "curve") */
+
+  Vector<ExternalNodeSocket> inputs;
+  Vector<ExternalNodeSocket> outputs;
+
+  /* Properties */
+  bool supports_preview;
+  bool is_expensive;
+
+  ExternalNodeDefinition() : supports_preview(false), is_expensive(false) {}
+};
+
+/**
  * Runtime representation of an external service.
  * Contains the service manifest and runtime state.
  */
@@ -95,7 +147,14 @@ struct ExternalNodeService {
   std::string api_base_url; /* Full base URL (e.g., "http://127.0.0.1:5000") */
   int restart_count;        /* Number of times service has been restarted */
 
-  ExternalNodeService() : is_running(false), process_handle(nullptr), restart_count(0) {}
+  /** Discovered nodes from this service */
+  Vector<ExternalNodeDefinition> nodes;
+  bool nodes_registered;    /* Whether nodes have been registered in Blender's node system */
+
+  ExternalNodeService()
+      : is_running(false), process_handle(nullptr), restart_count(0), nodes_registered(false)
+  {
+  }
 };
 
 /** \} */
@@ -164,6 +223,19 @@ class ExternalNodeServiceManager {
    * (Delegates to external_service_check_health in node_external_service_process.cc)
    */
   void check_service_health();
+
+  /**
+   * Register nodes from a service in Blender's node system.
+   * Creates bNodeType instances for each discovered node.
+   * Should be called after the node system is fully initialized.
+   */
+  void register_nodes_from_service(ExternalNodeService &service);
+
+  /**
+   * Register all nodes from all services that have been discovered but not yet registered.
+   * This should be called after the node system is fully initialized (e.g., during RNA registration).
+   */
+  void register_all_pending_nodes();
 
  private:
   ExternalNodeServiceManager() = default;

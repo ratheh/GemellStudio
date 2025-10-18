@@ -19,12 +19,28 @@
 #include "CLG_log.h"
 
 #include "BKE_appdir.hh"
+#include "BKE_node.hh"
 
 #include "BLI_fileops.hh"
+#include "BLI_map.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_serialize.hh"
 #include "BLI_string.h"
 #include "BLI_vector.hh"
+
+#include "NOD_geometry.hh"
+#include "NOD_geometry_exec.hh"
+#include "NOD_node_declaration.hh"
+#include "NOD_socket_declarations.hh"
+#include "NOD_socket_declarations_geometry.hh"
+
+#include "DNA_node_types.h"
+
+#include "RNA_access.hh"
+#include "RNA_define.hh"
+#include "RNA_prototypes.hh"
+
+#include "MEM_guardedalloc.h"
 
 #ifdef WIN32
 #  include "BLI_winstuff.h"
@@ -38,6 +54,30 @@ static CLG_LogRef LOG = {"bke.node_external_service"};
 namespace blender::bke {
 
 namespace fs = std::filesystem;
+
+/* -------------------------------------------------------------------- */
+/** \name Global Registries
+ * \{ */
+
+/**
+ * Global registry to store external node definitions.
+ * Maps node idname to its definition.
+ */
+static Map<std::string, ExternalNodeDefinition> g_external_node_registry;
+
+/**
+ * Storage for dynamically created RNA structs.
+ * These need to be freed during cleanup.
+ */
+static Vector<StructRNA *> g_external_node_rna_structs;
+
+/**
+ * Storage for dynamically allocated node types.
+ * These need to be unregistered and freed during cleanup.
+ */
+static Vector<bke::bNodeType *> g_external_node_types;
+
+/** \} */
 
 /* -------------------------------------------------------------------- */
 /** \name Singleton Access
@@ -89,6 +129,25 @@ void ExternalNodeServiceManager::cleanup()
 {
   /* Shutdown all running services (delegates to process helper) */
   external_service_shutdown_all(services_);
+
+  /* Unregister and free dynamically allocated node types */
+  CLOG_INFO(&LOG, "Unregistering %d external node type(s)...", int(g_external_node_types.size()));
+  for (bke::bNodeType *ntype : g_external_node_types) {
+    if (ntype) {
+      /* Unregister the node type from Blender's node system */
+      node_unregister_type(*ntype);
+      /* Free the allocated node type */
+      MEM_delete(ntype);
+    }
+  }
+  g_external_node_types.clear();
+
+  /* Note: We don't manually free RNA structs - Blender's RNA system manages their lifecycle.
+   * Attempting to free them here causes "freed while holding a Python reference" warnings. */
+
+  /* Clear node registries */
+  g_external_node_registry.clear();
+  g_external_node_rna_structs.clear();
 
   /* Release resources */
   services_.clear();
@@ -460,6 +519,278 @@ void ExternalNodeServiceManager::shutdown_all_services()
 void ExternalNodeServiceManager::check_service_health()
 {
   external_service_check_health(services_);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Node Registration
+ * \{ */
+
+/**
+ * Build node declaration (sockets) from external node definition.
+ */
+static void build_external_node_declaration(const ExternalNodeDefinition &node_def,
+                                             nodes::NodeDeclarationBuilder &b)
+{
+  using namespace blender::nodes::decl;
+
+  /* Add input sockets */
+  for (const ExternalNodeSocket &input : node_def.inputs) {
+    switch (input.socket_type) {
+      case SOCK_GEOMETRY: {
+        auto &socket = b.add_input<Geometry>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        break;
+      }
+      case SOCK_STRING: {
+        auto &socket = b.add_input<String>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        if (!input.default_string_value.empty()) {
+          socket.default_value(input.default_string_value);
+        }
+        break;
+      }
+      case SOCK_INT: {
+        auto &socket = b.add_input<Int>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        socket.default_value(input.default_int_value);
+        if (input.min_value.has_value()) {
+          socket.min(int(*input.min_value));
+        }
+        if (input.max_value.has_value()) {
+          socket.max(int(*input.max_value));
+        }
+        break;
+      }
+      case SOCK_FLOAT: {
+        auto &socket = b.add_input<Float>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        socket.default_value(input.default_float_value);
+        if (input.min_value.has_value()) {
+          socket.min(*input.min_value);
+        }
+        if (input.max_value.has_value()) {
+          socket.max(*input.max_value);
+        }
+        break;
+      }
+      case SOCK_BOOLEAN: {
+        auto &socket = b.add_input<Bool>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        socket.default_value(input.default_bool_value);
+        break;
+      }
+      case SOCK_VECTOR: {
+        auto &socket = b.add_input<blender::nodes::decl::Vector>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        break;
+      }
+      case SOCK_RGBA: {
+        auto &socket = b.add_input<Color>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        break;
+      }
+      default:
+        CLOG_WARN(&LOG, "Unsupported input socket type: %d", input.socket_type);
+        break;
+    }
+  }
+
+  /* Add output sockets */
+  for (const ExternalNodeSocket &output : node_def.outputs) {
+    switch (output.socket_type) {
+      case SOCK_GEOMETRY: {
+        auto &socket = b.add_output<Geometry>(output.name.c_str());
+        if (!output.description.empty()) {
+          socket.description(output.description.c_str());
+        }
+        break;
+      }
+      case SOCK_INT: {
+        auto &socket = b.add_output<Int>(output.name.c_str());
+        if (!output.description.empty()) {
+          socket.description(output.description.c_str());
+        }
+        break;
+      }
+      case SOCK_FLOAT: {
+        auto &socket = b.add_output<Float>(output.name.c_str());
+        if (!output.description.empty()) {
+          socket.description(output.description.c_str());
+        }
+        break;
+      }
+      case SOCK_VECTOR: {
+        auto &socket = b.add_output<blender::nodes::decl::Vector>(output.name.c_str());
+        if (!output.description.empty()) {
+          socket.description(output.description.c_str());
+        }
+        break;
+      }
+      default:
+        CLOG_WARN(&LOG, "Unsupported output socket type: %d", output.socket_type);
+        break;
+    }
+  }
+}
+
+/**
+ * Wrapper function for node declaration that looks up the node definition from registry.
+ * This is needed because we cannot use lambda captures in the declare function pointer.
+ */
+static void external_node_declare_wrapper(nodes::NodeDeclarationBuilder &b)
+{
+  /* Get the node being declared */
+  const bNode *node = b.node_or_null();
+  if (node == nullptr ||  node->typeinfo == nullptr) {
+    return;
+  }
+
+  /* Look up the node definition in the registry using the idname */
+  const ExternalNodeDefinition *node_def = g_external_node_registry.lookup_ptr(node->typeinfo->idname);
+  if (node_def == nullptr) {
+    CLOG_ERROR(&LOG,
+               "External node definition not found in registry: %s",
+               node->typeinfo->idname);
+    return;
+  }
+
+  /* Build the node declaration from the stored definition */
+  build_external_node_declaration(*node_def, b);
+}
+
+/**
+ * Poll function to check if external nodes can be added to a tree.
+ * Only allow external geometry nodes in geometry node trees.
+ */
+static bool external_node_poll(const bke::bNodeType * /*ntype*/,
+                                const bNodeTree *ntree,
+                                const char **r_disabled_hint)
+{
+  if (ntree && ntree->idname != std::string("GeometryNodeTree")) {
+    if (r_disabled_hint) {
+      *r_disabled_hint = "Not a geometry node tree";
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Stub execution function for external nodes.
+ * TODO: Implement actual execution by calling the external service via REST API.
+ */
+static void external_node_execute_stub(nodes::GeoNodeExecParams /* params */)
+{
+  CLOG_WARN(&LOG, "External node execution not yet implemented");
+  /* For now, just pass through geometry if there's a geometry input */
+  /* This prevents crashes when the node is evaluated */
+}
+
+void ExternalNodeServiceManager::register_all_pending_nodes()
+{
+  CLOG_INFO(&LOG, "Registering all pending external nodes...");
+
+  for (const std::unique_ptr<ExternalNodeService> &service : services_) {
+    if (!service->nodes_registered && !service->nodes.is_empty()) {
+      CLOG_INFO(&LOG,
+                "Registering %d node(s) from service '%s'",
+                service->nodes.size(),
+                service->manifest.service_name.c_str());
+      register_nodes_from_service(*service);
+    }
+  }
+}
+
+void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService &service)
+{
+  if (service.nodes_registered) {
+    CLOG_INFO(&LOG, "Nodes already registered for service '%s'", service.manifest.service_name.c_str());
+    return;
+  }
+
+  CLOG_INFO(&LOG,
+            "Registering %d node(s) from service '%s'",
+            service.nodes.size(),
+            service.manifest.service_name.c_str());
+
+  for (const ExternalNodeDefinition &node_def : service.nodes) {
+    /* Store node definition in global registry for lookup in declare function */
+    g_external_node_registry.add_overwrite(node_def.node_id, node_def);
+
+    CLOG_INFO(&LOG, "  Registering external node: '%s'", node_def.node_id.c_str());
+
+    /* Allocate node type on heap (will be freed by Blender's node system during shutdown) */
+    bke::bNodeType *ntype = MEM_new<bke::bNodeType>(__func__);
+
+    /* Initialize with node_type_base using NODE_CUSTOM to skip pre-compiled RNA lookup */
+    /* This sets default values, poll functions, and generates a unique legacy type */
+    CLOG_INFO(&LOG, "    Calling node_type_base with NODE_CUSTOM...");
+    node_type_base(*ntype, node_def.node_id, NODE_CUSTOM);
+    CLOG_INFO(&LOG, "    node_type_base completed");
+
+    /* Create RNA struct for this node type (required by node_register_type) */
+    /* We need to allocate the RNA struct dynamically for external nodes */
+    CLOG_INFO(&LOG, "    Creating RNA struct...");
+    StructRNA *srna = RNA_def_struct_ptr(&BLENDER_RNA, node_def.node_id.c_str(), &RNA_Node);
+    if (srna) {
+      ntype->rna_ext.srna = srna;
+      RNA_def_struct_ui_text(srna, node_def.name.c_str(), node_def.description.c_str());
+      RNA_def_struct_sdna(srna, "bNode");
+      /* Store the RNA struct for cleanup later */
+      g_external_node_rna_structs.append(srna);
+      /* Note: Icon will be set to default geometry node icon by the UI system */
+      CLOG_INFO(&LOG, "    RNA struct created successfully");
+    }
+    else {
+      CLOG_ERROR(&LOG, "    Failed to create RNA struct for node: %s", node_def.node_id.c_str());
+      MEM_delete(ntype);
+      continue;
+    }
+
+    /* Set custom node information */
+    ntype->ui_name = node_def.name;
+    ntype->ui_description = node_def.description;
+    ntype->nclass = NODE_CLASS_GEOMETRY;
+
+    /* Override poll function for geometry nodes */
+    ntype->poll = external_node_poll;
+
+    /* Set our custom functions */
+    ntype->declare = external_node_declare_wrapper;
+    ntype->geometry_node_execute = external_node_execute_stub;
+
+    /* Register the node type with Blender's node system */
+    CLOG_INFO(&LOG, "    Calling node_register_type...");
+    node_register_type(*ntype);
+    CLOG_INFO(&LOG, "    node_register_type completed");
+
+    /* Store the node type pointer for cleanup later */
+    g_external_node_types.append(ntype);
+
+    CLOG_INFO(&LOG, "  Successfully registered: %s (%s)",
+              node_def.name.c_str(),
+              node_def.node_id.c_str());
+  }
+
+  /* Mark nodes as registered */
+  service.nodes_registered = true;
+  CLOG_INFO(&LOG, "Completed node registration for service '%s'", service.manifest.service_name.c_str());
 }
 
 /** \} */

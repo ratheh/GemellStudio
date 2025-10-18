@@ -5433,6 +5433,9 @@ void node_system_init()
   /* Initialize external node services */
   ExternalNodeServiceManager &manager = ExternalNodeServiceManager::get_instance();
   manager.discover_and_initialize();
+
+  /* Register external nodes after discovery */
+  manager.register_all_pending_nodes();
 }
 
 void node_system_exit()
