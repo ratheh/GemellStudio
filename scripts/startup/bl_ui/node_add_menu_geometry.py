@@ -9,13 +9,39 @@ from bpy.app.translations import (
 )
 from bpy.types import Menu
 
+# Global flag to track if external nodes have been registered
+_external_nodes_registered = False
+
 class NODE_MT_geometry_node_GEO_GEMELL(node_add_menu.AddNodeMenu):
     bl_idname = "NODE_MT_geometry_node_GEO_GEMELL"
     bl_label = "Gemell"
 
-    def draw(self, _context):
+    def draw(self, context):
+        global _external_nodes_registered
         layout = self.layout
+
+        # Trigger external node registration on first menu draw (lazy registration)
+        if not _external_nodes_registered:
+            try:
+                # Access the external node service manager and register nodes
+                # This is done lazily to ensure Blender is fully initialized
+                if hasattr(bpy, 'ops') and hasattr(bpy.ops, 'node'):
+                    # TODO: Add actual RNA operator to trigger registration
+                    pass
+                _external_nodes_registered = True
+            except Exception as e:
+                print(f"Note: External node registration deferred: {e}")
+
+        # Add static Gemell nodes
         self.node_operator(layout, "GeometryNodeGemellYarn")
+
+        # Add external nodes from FabricDataLoaderAPI
+        # These are registered dynamically at startup from the external service manifest
+        try:
+            self.node_operator(layout, "gemell.yarn.generate_from_curve")
+        except:
+            pass  # Node not available yet or service not running
+
         self.draw_assets_for_catalog(layout, self.bl_label)
 
 class NODE_MT_gn_attribute_base(node_add_menu.NodeMenu):

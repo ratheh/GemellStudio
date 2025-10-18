@@ -28,6 +28,8 @@
 #include "BLI_serialize.hh"
 #include "BLI_string.h"
 
+#include "DNA_node_types.h"
+
 static CLG_LogRef LOG = {"bke.node_external_service"};
 
 namespace blender::bke {
@@ -110,6 +112,18 @@ bool external_service_launch(ExternalNodeService &service)
   /* Mark as running */
   service.is_running = true;
   CLOG_INFO(&LOG, "Service '%s' is running and healthy", service.manifest.service_name.c_str());
+
+  /* Query available nodes from service */
+  if (!external_service_query_nodes(service)) {
+    CLOG_WARN(&LOG, "Failed to query nodes from service, will retry later");
+    /* Don't fail launch, nodes can be queried later */
+  }
+  else {
+    CLOG_INFO(&LOG, "Node manifest loaded, nodes will be registered when node system is ready");
+    /* NOTE: We don't register nodes here because the node system may not be fully initialized yet.
+     * Nodes will be registered lazily when first accessed or during a later initialization phase.
+     * For now, just store the node definitions in the service structure. */
+  }
 
   return true;
 }
@@ -360,6 +374,245 @@ bool external_service_restart(ExternalNodeService &service)
 
   CLOG_ERROR(&LOG, "Failed to restart service '%s'", service.manifest.service_name.c_str());
   return false;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Node Discovery Functions
+ * \{ */
+
+/**
+ * Map JSON socket type string to Blender eNodeSocketDatatype.
+ */
+static int map_string_to_socket_type(blender::StringRef type_str)
+{
+  /* Socket type constants from DNA_node_types.h (eNodeSocketDatatype enum) */
+  if (type_str == "SOCK_FLOAT") {
+    return SOCK_FLOAT;
+  }
+  if (type_str == "SOCK_VECTOR") {
+    return SOCK_VECTOR;
+  }
+  if (type_str == "SOCK_RGBA") {
+    return SOCK_RGBA;
+  }
+  if (type_str == "SOCK_BOOLEAN") {
+    return SOCK_BOOLEAN;
+  }
+  if (type_str == "SOCK_INT") {
+    return SOCK_INT;
+  }
+  if (type_str == "SOCK_STRING") {
+    return SOCK_STRING;
+  }
+  if (type_str == "SOCK_OBJECT") {
+    return SOCK_OBJECT;
+  }
+  if (type_str == "SOCK_GEOMETRY") {
+    return SOCK_GEOMETRY;
+  }
+  if (type_str == "SOCK_COLLECTION") {
+    return SOCK_COLLECTION;
+  }
+  if (type_str == "SOCK_MATERIAL") {
+    return SOCK_MATERIAL;
+  }
+  return SOCK_CUSTOM;  /* Fallback for unknown types */
+}
+
+/**
+ * Parse socket definition from JSON value.
+ */
+static bool parse_socket_from_json(const io::serialize::Value *value, ExternalNodeSocket &socket)
+{
+  const io::serialize::DictionaryValue *dict = value->as_dictionary_value();
+  if (!dict) {
+    return false;
+  }
+
+  /* Parse socket name and description */
+  if (auto name = dict->lookup_str("name")) {
+    socket.name = std::string(*name);
+  }
+  if (auto desc = dict->lookup_str("description")) {
+    socket.description = std::string(*desc);
+  }
+
+  /* Parse socket type and map to Blender enum */
+  if (auto socket_type_str = dict->lookup_str("socket_type")) {
+    socket.socket_type = map_string_to_socket_type(*socket_type_str);
+  }
+
+  /* Parse subtype (for file paths, etc.) */
+  if (auto subtype = dict->lookup_str("subtype")) {
+    if (*subtype == "FILE_PATH") {
+      socket.subtype = 1;  /* Subtype flag for file path */
+    }
+  }
+
+  /* Parse constraints */
+  if (auto required = dict->lookup_int("required")) {
+    socket.required = (*required != 0);
+  }
+  if (auto min = dict->lookup_int("min")) {
+    socket.min_value = float(*min);
+  }
+  if (auto max = dict->lookup_int("max")) {
+    socket.max_value = float(*max);
+  }
+
+  /* Parse default values based on type */
+  if (const std::shared_ptr<io::serialize::Value> *default_val = dict->lookup("default")) {
+    if (const io::serialize::StringValue *str_val = (*default_val)->as_string_value()) {
+      socket.default_string_value = str_val->value();
+    }
+    else if (const io::serialize::IntValue *int_val = (*default_val)->as_int_value()) {
+      socket.default_int_value = int_val->value();
+      socket.default_float_value = float(int_val->value());
+    }
+    else if (const io::serialize::DoubleValue *double_val = (*default_val)->as_double_value()) {
+      socket.default_float_value = float(double_val->value());
+    }
+    else if (const io::serialize::BooleanValue *bool_val = (*default_val)->as_boolean_value()) {
+      socket.default_bool_value = bool_val->value();
+    }
+  }
+
+  return !socket.name.empty();
+}
+
+/**
+ * Parse node definition from JSON value.
+ */
+static bool parse_node_definition_from_json(const io::serialize::Value *value,
+                                            ExternalNodeDefinition &node_def)
+{
+  const io::serialize::DictionaryValue *dict = value->as_dictionary_value();
+  if (!dict) {
+    return false;
+  }
+
+  /* Parse basic metadata */
+  if (auto id = dict->lookup_str("id")) {
+    node_def.node_id = std::string(*id);
+    CLOG_INFO(&LOG, "  Parsed node ID: '%s'", node_def.node_id.c_str());
+  }
+  else {
+    CLOG_WARN(&LOG, "  Node missing 'id' field");
+  }
+
+  if (auto name = dict->lookup_str("name")) {
+    node_def.name = std::string(*name);
+    CLOG_INFO(&LOG, "  Parsed node name: '%s'", node_def.name.c_str());
+  }
+  else {
+    CLOG_WARN(&LOG, "  Node missing 'name' field");
+  }
+
+  if (auto desc = dict->lookup_str("description")) {
+    node_def.description = std::string(*desc);
+  }
+  if (auto category = dict->lookup_str("category")) {
+    node_def.category = std::string(*category);
+  }
+
+  /* Parse inputs */
+  const io::serialize::ArrayValue *inputs = dict->lookup_array("inputs");
+  if (inputs) {
+    for (const auto &input_value : inputs->elements()) {
+      ExternalNodeSocket socket;
+      if (parse_socket_from_json(input_value.get(), socket)) {
+        node_def.inputs.append(socket);
+      }
+    }
+  }
+
+  /* Parse outputs */
+  const io::serialize::ArrayValue *outputs = dict->lookup_array("outputs");
+  if (outputs) {
+    for (const auto &output_value : outputs->elements()) {
+      ExternalNodeSocket socket;
+      if (parse_socket_from_json(output_value.get(), socket)) {
+        node_def.outputs.append(socket);
+      }
+    }
+  }
+
+  /* Parse properties */
+  const io::serialize::DictionaryValue *props = dict->lookup_dict("properties");
+  if (props) {
+    if (auto supports_preview = props->lookup_int("supports_preview")) {
+      node_def.supports_preview = (*supports_preview != 0);
+    }
+    if (auto is_expensive = props->lookup_int("is_expensive")) {
+      node_def.is_expensive = (*is_expensive != 0);
+    }
+  }
+
+  return !node_def.node_id.empty();
+}
+
+bool external_service_query_nodes(ExternalNodeService &service)
+{
+  /* Build node discovery URL */
+  std::string discovery_url = service.api_base_url;
+
+  CLOG_INFO(&LOG, "Querying node manifest from: %s", discovery_url.c_str());
+
+  /* Make HTTP GET request */
+  http::HttpResponse response = http::http_get(discovery_url, 5000);
+
+  if (!response.success || response.status_code != 200) {
+    CLOG_ERROR(&LOG,
+               "Failed to query nodes: HTTP %d - %s",
+               response.status_code,
+               response.error_message.c_str());
+    return false;
+  }
+
+  CLOG_INFO(&LOG, "Received JSON response (length: %zu bytes)", response.body.length());
+  CLOG_INFO(&LOG, "Response body: %s", response.body.c_str());
+
+  /* Parse JSON response */
+  std::stringstream ss(response.body);
+  io::serialize::JsonFormatter formatter;
+  std::unique_ptr<io::serialize::Value> value = formatter.deserialize(ss);
+
+  if (!value) {
+    CLOG_ERROR(&LOG, "Failed to parse node manifest JSON");
+    return false;
+  }
+
+  /* Extract nodes array */
+  const io::serialize::DictionaryValue *root = value->as_dictionary_value();
+  if (!root) {
+    CLOG_ERROR(&LOG, "Node manifest root is not a JSON object");
+    return false;
+  }
+
+  const io::serialize::ArrayValue *nodes_array = root->lookup_array("nodes");
+  if (!nodes_array) {
+    CLOG_ERROR(&LOG, "Node manifest missing 'nodes' array");
+    return false;
+  }
+
+  /* Parse each node definition */
+  service.nodes.clear();
+  for (const auto &node_value : nodes_array->elements()) {
+    ExternalNodeDefinition node_def;
+    if (parse_node_definition_from_json(node_value.get(), node_def)) {
+      service.nodes.append(std::move(node_def));
+      CLOG_INFO(&LOG, "Loaded node: %s (%s)", node_def.name.c_str(), node_def.node_id.c_str());
+    }
+  }
+
+  CLOG_INFO(&LOG,
+            "Successfully loaded %d node(s) from service '%s'",
+            service.nodes.size(),
+            service.manifest.service_name.c_str());
+
+  return true;
 }
 
 /** \} */
