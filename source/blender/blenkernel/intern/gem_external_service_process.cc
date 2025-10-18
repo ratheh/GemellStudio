@@ -29,6 +29,7 @@
 #include "BLI_string.h"
 
 #include "DNA_node_types.h"
+#include "RNA_types.hh"
 
 static CLG_LogRef LOG = {"bke.node_external_service"};
 
@@ -447,7 +448,7 @@ static bool parse_socket_from_json(const io::serialize::Value *value, ExternalNo
   /* Parse subtype (for file paths, etc.) */
   if (auto subtype = dict->lookup_str("subtype")) {
     if (*subtype == "FILE_PATH") {
-      socket.subtype = 1;  /* Subtype flag for file path */
+      socket.subtype = PROP_FILEPATH;  /* PropertySubType for file path strings */
     }
   }
 

@@ -553,6 +553,10 @@ static void build_external_node_declaration(const ExternalNodeDefinition &node_d
         if (!input.default_string_value.empty()) {
           socket.default_value(input.default_string_value);
         }
+        /* Set subtype for special string types (e.g., file paths) */
+        if (input.subtype != 0) {
+          socket.subtype(PropertySubType(input.subtype));
+        }
         break;
       }
       case SOCK_INT: {
