@@ -2,6 +2,61 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# ==============================================================================
+# Protocol Buffers Integration (Phase 5)
+# ==============================================================================
+
+# Include FetchContent module for protobuf dependency
+include(FetchContent)
+
+# Fetch Protocol Buffers library (version 28.3 - latest stable)
+FetchContent_Declare(
+  protobuf
+  GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+  GIT_TAG        v28.3
+  GIT_SHALLOW    TRUE
+)
+
+# Configure protobuf options (disable tests, examples, etc.)
+set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(protobuf_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(protobuf_BUILD_PROTOC_BINARIES ON CACHE BOOL "" FORCE)
+set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
+set(protobuf_WITH_ZLIB ON CACHE BOOL "" FORCE)
+
+# Make protobuf available
+FetchContent_MakeAvailable(protobuf)
+
+# After FetchContent, the protobuf-generate module should be available
+# But we need to manually include it for the protobuf_generate() function
+list(APPEND CMAKE_MODULE_PATH "${protobuf_SOURCE_DIR}/cmake")
+include(protobuf-generate)
+
+# Compile .proto files to C++ sources
+set(PROTO_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/proto/gemell/geometry/v1/geometry.proto
+  ${CMAKE_CURRENT_SOURCE_DIR}/proto/gemell/geometry/v1/curves.proto
+  ${CMAKE_CURRENT_SOURCE_DIR}/proto/gemell/geometry/v1/attributes.proto
+  ${CMAKE_CURRENT_SOURCE_DIR}/proto/gemell/geometry/v1/materials.proto
+)
+
+# Set protobuf import path for proto files
+set(Protobuf_IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+
+# Generate C++ sources from .proto files using modern protobuf_generate
+add_library(gem_proto_generated OBJECT ${PROTO_FILES})
+target_link_libraries(gem_proto_generated PUBLIC libprotobuf)
+target_include_directories(gem_proto_generated PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+
+protobuf_generate(
+  TARGET gem_proto_generated
+  LANGUAGE cpp
+  IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
+  PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+# Add generated files to source list (will be added below)
+
 set(INC
   PUBLIC .
   ../ikplugin
@@ -22,6 +77,10 @@ set(INC
 
   # RNA_prototypes.hh
   ${CMAKE_BINARY_DIR}/source/blender/makesrna
+
+  # Protocol Buffers generated headers
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/proto
 )
 
 set(INC_SYS
@@ -30,6 +89,9 @@ set(INC_SYS
 
   # For `vfontdata_freetype.cc`.
   ${FREETYPE_INCLUDE_DIRS}
+
+  # Protocol Buffers includes
+  ${protobuf_SOURCE_DIR}/src
 )
 
 set(SRC
@@ -233,6 +295,7 @@ set(SRC
   intern/node_enum_definition.cc
   intern/node_external_service.cc
   intern/gem_external_service_process.cc
+  intern/gem_geometry_protobuf.cc
   intern/node_runtime.cc
   intern/node_socket_value.cc
   intern/node_tree_dot_export.cc
@@ -476,6 +539,7 @@ set(SRC
   BKE_node_enum.hh
   BKE_node_external_service.hh
   BKE_gem_external_service_process.hh
+  BKE_gem_geometry_protobuf.hh
   BKE_node_legacy_types.hh
   BKE_node_runtime.hh
   BKE_node_socket_value.hh
@@ -602,6 +666,9 @@ set(LIB
   PRIVATE bf::intern::atomic
   # For `vfontdata_freetype.c`.
   ${FREETYPE_LIBRARIES} ${BROTLI_LIBRARIES}
+  # Protocol Buffers library and generated code
+  gem_proto_generated
+  libprotobuf
 )
 
 if(WITH_BINRELOC)

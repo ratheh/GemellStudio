@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2025 Gemell Project Contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// ==============================================================================
+//                         DUAL-LICENSING NOTICE
+// ==============================================================================
+//
+// This file is part of the Gemell Geometry Protocol, a dual-licensed component
+// within the GemellStudio (GPL v3) project. This protocol definition is
+// MIT-licensed to enable interoperability with proprietary external services.
+
+syntax = "proto3";
+
+package gemell.geometry.v1;
+
+// 3D vector (position, tangent, normal, etc.)
+message Vec3f {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+// Curve geometry data structure
+//
+// Represents one or more curves with optional per-point and per-curve attributes.
+// Curves are defined by control points (positions) and curve_offsets that mark
+// the start of each curve in the positions array.
+//
+// Example: Two curves, first with 3 points, second with 2 points:
+//   positions = [(x0,y0,z0), (x1,y1,z1), (x2,y2,z2), (x3,y3,z3), (x4,y4,z4)]
+//   curve_offsets = [0, 3]  // First curve starts at 0, second at 3
+//   num_curves = 2
+//   num_points = 5
+message CurveGeometry {
+  // ------------------------------------------------------------------
+  // Point-domain attributes (per control point)
+  // ------------------------------------------------------------------
+
+  // Position of each control point (REQUIRED)
+  // Length: num_points
+  repeated Vec3f positions = 1;
+
+  // Radius at each control point (OPTIONAL)
+  // If empty, use default radius (e.g., 0.01)
+  // Length: num_points or 0
+  repeated float radii = 2;
+
+  // Tangent vector at each control point (OPTIONAL)
+  // If empty, tangents can be computed from positions
+  // Length: num_points or 0
+  repeated Vec3f tangents = 3;
+
+  // Curve parameter t ∈ [0,1] at each control point (OPTIONAL)
+  // Useful for guide curves with explicit parameterization
+  // Length: num_points or 0
+  repeated float parameters = 4;
+
+  // Normal vector at each control point (OPTIONAL, reserved for future use)
+  // Length: num_points or 0
+  reserved 5;  // repeated Vec3f normals = 5;
+
+  // ------------------------------------------------------------------
+  // Curve-domain attributes (per curve)
+  // ------------------------------------------------------------------
+
+  // Start index of each curve in the positions array (REQUIRED)
+  // Length: num_curves
+  // Example: [0, 10, 25] means curve 0 has points 0-9, curve 1 has points 10-24, etc.
+  repeated int32 curve_offsets = 10;
+
+  // Material index for each curve (OPTIONAL)
+  // References material profiles (see materials.proto)
+  // Length: num_curves or 0
+  repeated int32 material_indices = 11;
+
+  // Curve type for each curve (OPTIONAL, reserved for future use)
+  // Could be: BEZIER, NURBS, CATMULL_ROM, POLY, etc.
+  reserved 12;  // repeated CurveType curve_types = 12;
+
+  // ------------------------------------------------------------------
+  // Metadata
+  // ------------------------------------------------------------------
+
+  // Number of curves in this geometry (REQUIRED)
+  int32 num_curves = 20;
+
+  // Total number of control points across all curves (REQUIRED)
+  int32 num_points = 21;
+
+  // Protocol version (for compatibility checks)
+  // Default: 1
+  uint32 version = 30;
+
+  // ------------------------------------------------------------------
+  // Reserved field numbers for future expansion
+  // ------------------------------------------------------------------
+
+  reserved 100 to 199;  // Reserved for future point-domain attributes
+  reserved 200 to 299;  // Reserved for future curve-domain attributes
+}

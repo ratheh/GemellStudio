@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2025 Gemell Project Contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// ==============================================================================
+//                         DUAL-LICENSING NOTICE
+// ==============================================================================
+//
+// This file is part of the Gemell Geometry Protocol, a dual-licensed component
+// within the GemellStudio (GPL v3) project. This protocol definition is
+// MIT-licensed to enable interoperability with proprietary external services.
+
+syntax = "proto3";
+
+package gemell.geometry.v1;
+
+import "gemell/geometry/v1/attributes.proto";
+
+// Material profile for curve rendering
+//
+// This message provides two approaches for material data:
+// 1. Opaque serialized blob (e.g., Warp's pbMaterialProfile)
+// 2. Explicit field-based representation (future expansion)
+message MaterialProfile {
+  // Approach 1: Opaque serialized material profile
+  //
+  // Contains a serialized material profile from an external system (e.g., Warp).
+  // Blender doesn't need to understand the internal structure; it just passes
+  // this data through to rendering or stores it with the geometry.
+  //
+  // Example: Warp's WarpPb::MaterialProfile serialized to bytes
+  bytes serialized_profile = 1;
+
+  // Approach 2: Explicit material properties (reserved for future use)
+  //
+  // If we want Blender to have native understanding of material properties,
+  // we can add explicit fields here. For now, we use the opaque blob approach.
+  //
+  // Example future fields:
+  //   string material_name = 10;
+  //   ColorRGBA base_color = 11;
+  //   float roughness = 12;
+  //   float metallic = 13;
+  //   string texture_path = 14;
+  //   map<string, AttributeData> custom_properties = 20;
+
+  // Material profile format identifier
+  // Examples: "warp_v1", "blender_principled_bsdf", "pbr_standard"
+  // This helps the receiver know how to interpret serialized_profile
+  string format = 2;
+
+  // Material profile version (for compatibility)
+  // Example: 1 for "warp_v1"
+  uint32 version = 3;
+
+  // Human-readable material name (optional)
+  string name = 4;
+
+  // Reserved for future explicit material properties
+  reserved 10 to 99;
+
+  // Reserved for future expansion
+  reserved 100 to 199;
+}
+
+// Array of material profiles
+//
+// Used when external services return multiple material profiles
+// (e.g., one per curve in CurveGeometry.material_indices)
+message MaterialProfileArray {
+  repeated MaterialProfile profiles = 1;
+}

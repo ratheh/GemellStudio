@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+//
+// MIT License
+//
+// Copyright (c) 2025 Gemell Project Contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// ==============================================================================
+//                         DUAL-LICENSING NOTICE
+// ==============================================================================
+//
+// This file is part of the Gemell Geometry Protocol, a dual-licensed component
+// within the GemellStudio (GPL v3) project. This protocol definition is
+// MIT-licensed to enable interoperability with proprietary external services.
+
+syntax = "proto3";
+
+package gemell.geometry.v1;
+
+import "gemell/geometry/v1/curves.proto";
+import "gemell/geometry/v1/attributes.proto";
+import "gemell/geometry/v1/materials.proto";
+
+// Top-level geometry data container for Blender ↔ External Service IPC
+//
+// This is the root message type used in shared memory communication between
+// Blender (GemellStudio) and external geometry node services (e.g., Warp).
+//
+// Architecture:
+//   1. Blender serializes GeometryData to protobuf bytes
+//   2. Blender writes bytes to shared memory region
+//   3. Blender sends shared memory ID to external service via REST API
+//   4. External service maps shared memory, parses GeometryData
+//   5. External service processes geometry, creates output GeometryData
+//   6. External service writes output to new shared memory region
+//   7. External service returns output shared memory ID to Blender
+//   8. Blender maps output shared memory, parses GeometryData
+//
+// Extensibility:
+//   - Use `oneof geometry_type` to support future geometry types (mesh, points, etc.)
+//   - Use `attributes` map for arbitrary custom data
+//   - Version field for protocol compatibility checks
+message GeometryData {
+  // ------------------------------------------------------------------
+  // Geometry type (exactly one must be set)
+  // ------------------------------------------------------------------
+
+  oneof geometry_type {
+    CurveGeometry curves = 1;        // Curve/spline geometry
+    // Future geometry types:
+    // MeshGeometry mesh = 2;         // Triangle mesh geometry
+    // PointCloudGeometry points = 3; // Point cloud geometry
+    // VolumeGeometry volume = 4;     // Volumetric data
+    // InstanceGeometry instances = 5; // Instanced geometry
+  }
+
+  // ------------------------------------------------------------------
+  // Generic attributes (custom user data)
+  // ------------------------------------------------------------------
+
+  // Arbitrary named attributes attached to the geometry
+  // Key: Attribute name (e.g., "uv", "color", "weight", "custom_data")
+  // Value: Attribute data (float/int/vec3/string arrays)
+  map<string, AttributeData> attributes = 10;
+
+  // ------------------------------------------------------------------
+  // Material data (optional)
+  // ------------------------------------------------------------------
+
+  // Material profiles associated with this geometry
+  // For curves: typically one per curve (referenced by CurveGeometry.material_indices)
+  // For mesh: typically one per face or material slot
+  MaterialProfileArray material_profiles = 15;
+
+  // ------------------------------------------------------------------
+  // Metadata
+  // ------------------------------------------------------------------
+
+  // Protocol version for compatibility checks
+  // Current version: 1
+  // Increment on breaking changes to geometry_type or attributes structure
+  uint32 version = 20;
+
+  // Human-readable description (optional, for debugging)
+  string description = 21;
+
+  // Timestamp of geometry creation (Unix timestamp in seconds, optional)
+  uint64 timestamp = 22;
+
+  // Session ID that created this geometry (optional, for tracking)
+  string session_id = 23;
+
+  // ------------------------------------------------------------------
+  // Reserved field numbers for future expansion
+  // ------------------------------------------------------------------
+
+  // Reserved for additional geometry types
+  reserved 6 to 9;
+
+  // Reserved for future metadata fields
+  reserved 24 to 49;
+
+  // Reserved for future top-level data
+  reserved 50 to 99;
+
+  // Reserved for extensions
+  reserved 100 to 199;
+}
+
+// Optional: Batch of multiple geometry data objects
+//
+// Useful for operations that process multiple geometries at once
+// (e.g., boolean operations, merging, batched execution)
+message GeometryDataBatch {
+  repeated GeometryData geometries = 1;
+
+  // Batch metadata
+  string batch_id = 10;
+  string description = 11;
+}
