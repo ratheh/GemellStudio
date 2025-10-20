@@ -99,11 +99,12 @@ SharedMemoryHandle open_shared_memory(const std::string &name);
  * Unmap and release a shared memory region.
  *
  * \param handle: Handle to the shared memory to release
+ * \param keep_alive: If true (default false), keeps the handle alive for other processes (Windows).
  *
- * **Note**: Does not delete the underlying shared memory object if not the owner.
- * Use destroy_shared_memory() to fully delete the shared memory region.
+ * **Windows**: Closing the handle destroys the shared memory. Use keep_alive=true for IPC.
+ * **POSIX**: The fd is always closed; memory persists until shm_unlink() is called.
  */
-void unmap_shared_memory(SharedMemoryHandle &handle);
+void unmap_shared_memory(SharedMemoryHandle &handle, bool keep_alive = false);
 
 /**
  * Destroy a shared memory region (removes from system).

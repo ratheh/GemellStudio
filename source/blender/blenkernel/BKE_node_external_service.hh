@@ -86,7 +86,8 @@ struct ExternalServiceManifest {
  * Describes input or output socket metadata from external service.
  */
 struct ExternalNodeSocket {
-  std::string name;
+  std::string name;        /* Display name shown in Blender UI (e.g., "GEM File") */
+  std::string identifier;  /* camelCase API parameter name (e.g., "gemFilePath") */
   std::string description;
   int socket_type;  /* eNodeSocketDatatype (SOCK_GEOMETRY, SOCK_STRING, etc.) */
   int subtype;      /* Socket subtype flags (e.g., for FILE_PATH) */

@@ -432,9 +432,12 @@ static bool parse_socket_from_json(const io::serialize::Value *value, ExternalNo
     return false;
   }
 
-  /* Parse socket name and description */
+  /* Parse socket name, identifier, and description */
   if (auto name = dict->lookup_str("name")) {
     socket.name = std::string(*name);
+  }
+  if (auto identifier = dict->lookup_str("identifier")) {
+    socket.identifier = std::string(*identifier);
   }
   if (auto desc = dict->lookup_str("description")) {
     socket.description = std::string(*desc);
