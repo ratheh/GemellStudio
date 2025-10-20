@@ -464,6 +464,21 @@ Curves *protobuf_to_curves(const std::vector<uint8_t> &protobuf_data)
     params.finish();
   }
 
+  // Copy material indices if present (curve-domain attribute)
+  if (curve_geom.material_indices_size() == curve_geom.num_curves()) {
+    bke::MutableAttributeAccessor attributes = curves_geom.attributes_for_write();
+    bke::SpanAttributeWriter<int> material_indices =
+        attributes.lookup_or_add_for_write_span<int>("material_index", bke::AttrDomain::Curve);
+    for (int i = 0; i < curve_geom.num_curves(); i++) {
+      material_indices.span[i] = curve_geom.material_indices(i);
+    }
+    material_indices.finish();
+
+    CLOG_INFO(&LOG,
+              "Loaded material indices for %d curves (domain: Curve)",
+              curve_geom.num_curves());
+  }
+
   CLOG_INFO(&LOG,
             "Deserialized %d curves with %d points from protobuf",
             curve_geom.num_curves(),
