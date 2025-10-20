@@ -22,6 +22,15 @@
 
 #include "BKE_attribute.hh"
 #include "BKE_curves.hh"
+#include "BKE_geometry_set.hh"
+#include "BKE_object.hh"
+#include "BKE_object_types.hh"
+
+/* For geometry nodes support */
+#include "DNA_object_types.h"
+
+/* Forward declaration workaround for GeometrySet */
+using blender::bke::GeometrySet;
 
 CCL_NAMESPACE_BEGIN
 
@@ -1022,9 +1031,31 @@ void BlenderSync::sync_hair(Hair *hair, BObjectInfo &b_ob_info, bool motion, con
                                      (b_scene.render().fps() / b_scene.render().fps_base()) :
                                  0.0f;
 
-  /* Convert Blender hair to Cycles curves. */
-  const blender::bke::CurvesGeometry &b_curves(
-      static_cast<const ::Curves *>(b_ob_info.object_data.ptr.data)->geometry.wrap());
+  /* Get curves geometry - check geometry nodes output first, then base object data. */
+  const blender::bke::CurvesGeometry *b_curves_ptr = nullptr;
+  const ::Curves *curves_data = nullptr;
+
+  /* Check if geometry nodes modifier outputs curves */
+  const ::Object *object = reinterpret_cast<const ::Object *>(b_ob_info.real_object.ptr.data);
+  if (object && object->runtime && object->runtime->geometry_set_eval) {
+    const GeometrySet *geometry_set = object->runtime->geometry_set_eval;
+    if (geometry_set->has_curves()) {
+      curves_data = geometry_set->get_curves();
+      if (curves_data) {
+        b_curves_ptr = &curves_data->geometry.wrap();
+      }
+    }
+  }
+
+  /* Fallback to base object data if no geometry nodes output */
+  if (b_curves_ptr == nullptr) {
+    curves_data = static_cast<const ::Curves *>(b_ob_info.object_data.ptr.data);
+    b_curves_ptr = &curves_data->geometry.wrap();
+  }
+
+  const blender::bke::CurvesGeometry &b_curves = *b_curves_ptr;
+
+  /* Export curves to Cycles */
   if (motion) {
     export_hair_curves_motion(hair, b_curves, motion_step);
   }
@@ -1052,8 +1083,22 @@ void BlenderSync::sync_hair(BObjectInfo &b_ob_info, Hair *hair)
   new_hair.set_used_shaders(used_shaders);
 
   if (view_layer.use_hair) {
-    if (b_ob_info.object_data.is_a(&RNA_Curves)) {
-      /* Hair object. */
+    /* Check if we have curves from geometry nodes or native Curves object */
+    bool has_curves = b_ob_info.object_data.is_a(&RNA_Curves);
+
+    /* Also check geometry nodes output for curves */
+    if (!has_curves) {
+      const ::Object *object = reinterpret_cast<const ::Object *>(b_ob_info.real_object.ptr.data);
+      if (object && object->runtime && object->runtime->geometry_set_eval) {
+        const GeometrySet *geometry_set = object->runtime->geometry_set_eval;
+        if (geometry_set->has_curves()) {
+          has_curves = true;
+        }
+      }
+    }
+
+    if (has_curves) {
+      /* Hair object or geometry nodes curves. */
       sync_hair(&new_hair, b_ob_info, false);
     }
     else {

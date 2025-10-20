@@ -24,6 +24,12 @@
 
 #include "BKE_duplilist.hh"
 
+/* For geometry nodes support */
+#include "DNA_object_types.h"
+#include "BKE_object.hh"
+#include "BKE_object_types.hh"
+#include "BKE_geometry_set.hh"
+
 CCL_NAMESPACE_BEGIN
 
 /* Utilities */
@@ -67,7 +73,23 @@ bool BlenderSync::object_is_geometry(BObjectInfo &b_ob_info)
     return true;
   }
 
-  return b_ob_data.is_a(&RNA_Mesh);
+  if (b_ob_data.is_a(&RNA_Mesh)) {
+    return true;
+  }
+
+  /* Check if geometry nodes modifier outputs renderable geometry (curves, mesh, pointcloud, volume).
+   * This allows legacy curve objects or other object types with geometry nodes
+   * to be rendered by Cycles. */
+  const ::Object *object = reinterpret_cast<const ::Object *>(b_ob_info.real_object.ptr.data);
+  if (object && object->runtime && object->runtime->geometry_set_eval) {
+    const blender::bke::GeometrySet *geometry_set = object->runtime->geometry_set_eval;
+    if (geometry_set->has_curves() || geometry_set->has_mesh() ||
+        geometry_set->has_pointcloud() || geometry_set->has_volume()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 bool BlenderSync::object_can_have_geometry(BL::Object &b_ob)

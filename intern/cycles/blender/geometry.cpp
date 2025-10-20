@@ -15,12 +15,32 @@
 
 #include "util/task.h"
 
+/* Blender headers for geometry nodes support */
+#include "DNA_object_types.h"
+#include "BKE_object.hh"
+#include "BKE_object_types.hh"
+#include "BKE_geometry_set.hh"
+
+/* Forward declaration workaround for GeometrySet */
+using blender::bke::GeometrySet;
+
 CCL_NAMESPACE_BEGIN
 
 static Geometry::Type determine_geom_type(BObjectInfo &b_ob_info, bool use_particle_hair)
 {
   if (b_ob_info.object_data.is_a(&RNA_Light)) {
     return Geometry::LIGHT;
+  }
+
+  /* Check if geometry nodes modifier outputs Curves (new hair curves system).
+   * This allows legacy curve objects or other object types with geometry nodes
+   * to render as hair curves in Cycles. */
+  const ::Object *object = reinterpret_cast<const ::Object *>(b_ob_info.real_object.ptr.data);
+  if (object && object->runtime && object->runtime->geometry_set_eval) {
+    const GeometrySet *geometry_set = object->runtime->geometry_set_eval;
+    if (geometry_set->has_curves()) {
+      return Geometry::HAIR;
+    }
   }
 
   if (b_ob_info.object_data.is_a(&RNA_Curves) || use_particle_hair) {
