@@ -49,6 +49,11 @@
 #  include <sys/stat.h>
 #endif
 
+/* Forward declaration of external node execution function (implemented in node_geo_external.cc) */
+namespace blender::nodes {
+void execute_external_geometry_node(GeoNodeExecParams params);
+}  // namespace blender::nodes
+
 static CLG_LogRef LOG = {"bke.node_external_service"};
 
 namespace blender::bke {
@@ -696,14 +701,12 @@ static bool external_node_poll(const bke::bNodeType * /*ntype*/,
 }
 
 /**
- * Stub execution function for external nodes.
- * TODO: Implement actual execution by calling the external service via REST API.
+ * Execution wrapper for external nodes.
+ * Delegates to the actual implementation in node_geo_external.cc
  */
-static void external_node_execute_stub(nodes::GeoNodeExecParams /* params */)
+static void external_node_execute_wrapper(nodes::GeoNodeExecParams params)
 {
-  CLOG_WARN(&LOG, "External node execution not yet implemented");
-  /* For now, just pass through geometry if there's a geometry input */
-  /* This prevents crashes when the node is evaluated */
+  nodes::execute_external_geometry_node(params);
 }
 
 void ExternalNodeServiceManager::register_all_pending_nodes()
@@ -777,7 +780,7 @@ void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService
 
     /* Set our custom functions */
     ntype->declare = external_node_declare_wrapper;
-    ntype->geometry_node_execute = external_node_execute_stub;
+    ntype->geometry_node_execute = external_node_execute_wrapper;
 
     /* Register the node type with Blender's node system */
     CLOG_INFO(&LOG, "    Calling node_register_type...");

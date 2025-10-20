@@ -57,6 +57,33 @@ namespace blender::bke::protobuf {
 // Shared Memory Management (Platform-Specific)
 // ============================================================================
 
+#ifdef _WIN32
+/**
+ * Create Windows security descriptor that allows cross-process access.
+ * Returns a heap-allocated descriptor that must be freed by the caller.
+ */
+static SECURITY_DESCRIPTOR *create_permissive_security_descriptor()
+{
+  SECURITY_DESCRIPTOR *sd = (SECURITY_DESCRIPTOR *)malloc(sizeof(SECURITY_DESCRIPTOR));
+  if (sd == nullptr) {
+    return nullptr;
+  }
+
+  if (!InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION)) {
+    free(sd);
+    return nullptr;
+  }
+
+  /* NULL DACL = allow all access to all users */
+  if (!SetSecurityDescriptorDacl(sd, TRUE, nullptr, FALSE)) {
+    free(sd);
+    return nullptr;
+  }
+
+  return sd;
+}
+#endif
+
 SharedMemoryHandle create_shared_memory(const std::string &name, size_t size)
 {
   SharedMemoryHandle handle;
@@ -65,16 +92,28 @@ SharedMemoryHandle create_shared_memory(const std::string &name, size_t size)
   handle.is_owner = true;
 
 #ifdef _WIN32
-  // Windows implementation using CreateFileMapping
+  // Windows implementation using CreateFileMapping with cross-process security
   std::string mapping_name = "Local\\" + name;
 
+  /* Create security descriptor that allows cross-process access */
+  SECURITY_DESCRIPTOR *sd = create_permissive_security_descriptor();
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+  sa.bInheritHandle = FALSE;
+  sa.lpSecurityDescriptor = sd;
+
   HANDLE win_handle = CreateFileMappingA(INVALID_HANDLE_VALUE,
-                                          nullptr,
+                                          sd ? &sa : nullptr,  /* Use secure attrs if available */
                                           PAGE_READWRITE,
                                           (DWORD)(size >> 32),
                                           (DWORD)(size & 0xFFFFFFFF),
                                           mapping_name.c_str());
   handle.handle = win_handle;
+
+  /* Free security descriptor after creating mapping */
+  if (sd) {
+    free(sd);
+  }
 
   if (win_handle == nullptr) {
     DWORD error = GetLastError();
@@ -94,6 +133,11 @@ SharedMemoryHandle create_shared_memory(const std::string &name, size_t size)
     handle.handle = nullptr;
     return handle;
   }
+
+  CLOG_INFO(&LOG,
+            "Created shared memory '%s' with cross-process security (size: %zu bytes)",
+            mapping_name.c_str(),
+            size);
 
 #else
   // Unix/Linux/macOS implementation using POSIX shared memory
@@ -199,7 +243,7 @@ SharedMemoryHandle open_shared_memory(const std::string &name)
   return handle;
 }
 
-void unmap_shared_memory(SharedMemoryHandle &handle)
+void unmap_shared_memory(SharedMemoryHandle &handle, bool keep_alive)
 {
   if (handle.mapped_ptr == nullptr) {
     return;
@@ -207,21 +251,28 @@ void unmap_shared_memory(SharedMemoryHandle &handle)
 
 #ifdef _WIN32
   UnmapViewOfFile(handle.mapped_ptr);
-  if (handle.handle != nullptr) {
+  /* On Windows, we must keep the handle alive for other processes to access the memory.
+   * Only close the handle if keep_alive is false (when we're done with the memory). */
+  if (!keep_alive && handle.handle != nullptr) {
     CloseHandle(static_cast<HANDLE>(handle.handle));
     handle.handle = nullptr;
+    CLOG_INFO(&LOG, "Closed handle for shared memory '%s'", handle.memory_id.c_str());
   }
 #else
   munmap(handle.mapped_ptr, handle.size);
+  /* On POSIX, closing the fd doesn't destroy the memory (need shm_unlink for that).
+   * We can close it immediately. */
   if (handle.fd != -1) {
     close(handle.fd);
     handle.fd = -1;
   }
 #endif
 
-  CLOG_INFO(&LOG, "Unmapped shared memory '%s'", handle.memory_id.c_str());
+  CLOG_INFO(&LOG,
+            "Unmapped shared memory '%s' (handle %s)",
+            handle.memory_id.c_str(),
+            keep_alive ? "kept alive" : "closed");
   handle.mapped_ptr = nullptr;
-  handle.size = 0;
 }
 
 void destroy_shared_memory(const std::string &name)
@@ -442,23 +493,36 @@ std::string create_shared_memory_from_curves(const Curves *curves, const std::st
   // Generate unique memory ID
   std::string memory_id = generate_memory_id("geonodes_input", session_id);
 
-  // Create shared memory
-  SharedMemoryHandle handle = create_shared_memory(memory_id, protobuf_data.size());
+  // Create shared memory with 8-byte header + protobuf data
+  // Header format: uint64_t data_size (little-endian)
+  const size_t header_size = sizeof(uint64_t);
+  const size_t total_size = header_size + protobuf_data.size();
+
+  SharedMemoryHandle handle = create_shared_memory(memory_id, total_size);
   if (handle.mapped_ptr == nullptr) {
     CLOG_ERROR(&LOG, "Failed to create shared memory");
     return "";
   }
 
-  // Copy protobuf data to shared memory
-  memcpy(handle.mapped_ptr, protobuf_data.data(), protobuf_data.size());
+  // Write 8-byte size header (little-endian uint64_t)
+  uint64_t data_size = static_cast<uint64_t>(protobuf_data.size());
+  memcpy(handle.mapped_ptr, &data_size, sizeof(uint64_t));
 
-  // Unmap (but don't destroy - external service will read it)
-  unmap_shared_memory(handle);
+  // Write protobuf data after header
+  memcpy(static_cast<uint8_t *>(handle.mapped_ptr) + header_size,
+         protobuf_data.data(),
+         protobuf_data.size());
+
+  // Unmap but keep handle alive for external service to read
+  // On Windows, closing the handle would destroy the shared memory
+  unmap_shared_memory(handle, /* keep_alive = */ true);
 
   CLOG_INFO(&LOG,
-            "Created shared memory '%s' with %zu bytes of curve data",
+            "Created shared memory '%s' with 8-byte header + %zu bytes of protobuf data (total: "
+            "%zu bytes)",
             memory_id.c_str(),
-            protobuf_data.size());
+            protobuf_data.size(),
+            total_size);
 
   return memory_id;
 }
@@ -477,12 +541,49 @@ Curves *read_curves_from_shared_memory(const std::string &memory_id)
     return nullptr;
   }
 
-  // Copy data from shared memory to vector
-  std::vector<uint8_t> protobuf_data(handle.size);
-  memcpy(protobuf_data.data(), handle.mapped_ptr, handle.size);
+  // Read 8-byte size header (little-endian uint64_t)
+  const size_t header_size = sizeof(uint64_t);
+  if (handle.size < header_size) {
+    CLOG_ERROR(&LOG, "Shared memory '%s' too small (%zu bytes)", memory_id.c_str(), handle.size);
+    unmap_shared_memory(handle, /* keep_alive = */ false);
+    return nullptr;
+  }
 
-  // Unmap shared memory
-  unmap_shared_memory(handle);
+  uint64_t data_size = 0;
+  memcpy(&data_size, handle.mapped_ptr, sizeof(uint64_t));
+
+  // Validate size (allow Windows page-aligned sizes to be larger)
+  if (data_size + header_size > handle.size) {
+    CLOG_ERROR(&LOG,
+               "Invalid size in shared memory '%s': header says %llu bytes, but total size is %zu "
+               "bytes",
+               memory_id.c_str(),
+               static_cast<unsigned long long>(data_size),
+               handle.size);
+    unmap_shared_memory(handle, /* keep_alive = */ false);
+    return nullptr;
+  }
+
+  if (data_size + header_size != handle.size) {
+    CLOG_INFO(&LOG,
+              "Shared memory '%s' is page-aligned: header says %llu bytes protobuf data, total "
+              "size is %zu bytes (padding: %zu bytes)",
+              memory_id.c_str(),
+              static_cast<unsigned long long>(data_size),
+              handle.size,
+              handle.size - (data_size + header_size));
+  }
+
+  // Copy protobuf data using size from header (NOT total memory size)
+  // This is important because Windows rounds shared memory to page boundaries
+  const size_t protobuf_size = static_cast<size_t>(data_size);
+  std::vector<uint8_t> protobuf_data(protobuf_size);
+  memcpy(protobuf_data.data(),
+         static_cast<uint8_t *>(handle.mapped_ptr) + header_size,
+         protobuf_size);
+
+  // Unmap and close handle (we're done reading)
+  unmap_shared_memory(handle, /* keep_alive = */ false);
 
   // Deserialize protobuf to curves
   Curves *curves = protobuf_to_curves(protobuf_data);

@@ -28,6 +28,7 @@ set(INC_SYS
 )
 
 set(SRC
+  nodes/node_geo_external.cc
   nodes/node_geo_gemell_yarn.cc
   nodes/node_geo_accumulate_field.cc
   nodes/node_geo_attribute_capture.cc
