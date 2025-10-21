@@ -98,6 +98,25 @@ message CurveGeometry {
   // Could be: BEZIER, NURBS, CATMULL_ROM, POLY, etc.
   reserved 12;  // repeated CurveType curve_types = 12;
 
+  // Material profile index for each curve (OPTIONAL)
+  // References the MaterialProfile array in GeometryData.material_profiles
+  // Used for advanced material access (full material properties beyond color)
+  // Length: num_curves or 0
+  repeated int32 material_profile_indices = 13;
+
+  // Per-curve color in Scene Linear RGB color space with premultiplied alpha (OPTIONAL)
+  // Format: Packed as 4 floats per curve [r, g, b, a]
+  // Color space: Scene Linear (matches Blender's ColorGeometry4f / ColorSceneLinear4f)
+  //   - RGB channels are NOT gamma-corrected (linear light values)
+  //   - Compatible with Blender's internal geometry color representation
+  // Alpha: Premultiplied (RGB channels already multiplied by alpha)
+  //   - Matches Blender's ColorGeometry4f convention
+  //   - For semi-transparent curves, RGB values are reduced proportionally
+  // Length: num_curves * 4 floats, or 0 (optional)
+  // Access pattern: Curve i color is at indices [i*4+0, i*4+1, i*4+2, i*4+3]
+  // Conversion: Generated from MaterialData.color_argb (sRGB) via sRGB→Linear transform
+  repeated float curve_colors_linear_rgba = 14;
+
   // ------------------------------------------------------------------
   // Metadata
   // ------------------------------------------------------------------

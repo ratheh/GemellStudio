@@ -29,6 +29,7 @@
 #include "BKE_attribute.hh"
 #include "BKE_curves.hh"
 
+#include "BLI_color_types.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_string.h"
 
@@ -476,6 +477,52 @@ Curves *protobuf_to_curves(const std::vector<uint8_t> &protobuf_data)
 
     CLOG_INFO(&LOG,
               "Loaded material indices for %d curves (domain: Curve)",
+              curve_geom.num_curves());
+  }
+
+  // Copy material profile indices if present (curve-domain attribute)
+  if (curve_geom.material_profile_indices_size() == curve_geom.num_curves()) {
+    bke::MutableAttributeAccessor attributes = curves_geom.attributes_for_write();
+    bke::SpanAttributeWriter<int> material_profile_indices =
+        attributes.lookup_or_add_for_write_span<int>("material_profile_index",
+                                                      bke::AttrDomain::Curve);
+    for (int i = 0; i < curve_geom.num_curves(); i++) {
+      material_profile_indices.span[i] = curve_geom.material_profile_indices(i);
+    }
+    material_profile_indices.finish();
+
+    CLOG_INFO(&LOG,
+              "Loaded material profile indices for %d curves (domain: Curve)",
+              curve_geom.num_curves());
+  }
+
+  // Copy per-curve colors if present (curve-domain attribute)
+  // Format: 4 floats per curve [r, g, b, a] in Scene Linear color space (premultiplied alpha)
+  // Matches Blender's ColorGeometry4f = ColorSceneLinear4f<eAlpha::Premultiplied>
+  if (curve_geom.curve_colors_linear_rgba_size() == curve_geom.num_curves() * 4) {
+    bke::MutableAttributeAccessor attributes = curves_geom.attributes_for_write();
+
+    // Create curve-domain color attribute (like material_index)
+    bke::SpanAttributeWriter<ColorGeometry4f> curve_colors =
+        attributes.lookup_or_add_for_write_span<ColorGeometry4f>("curve_color",
+                                                                  bke::AttrDomain::Curve);
+
+    for (int i = 0; i < curve_geom.num_curves(); i++) {
+      // Extract 4 floats for this curve (r, g, b, a)
+      int base_idx = i * 4;
+      float r = curve_geom.curve_colors_linear_rgba(base_idx + 0);
+      float g = curve_geom.curve_colors_linear_rgba(base_idx + 1);
+      float b = curve_geom.curve_colors_linear_rgba(base_idx + 2);
+      float a = curve_geom.curve_colors_linear_rgba(base_idx + 3);
+
+      // ColorGeometry4f is Scene Linear with premultiplied alpha - direct assignment
+      curve_colors.span[i] = ColorGeometry4f(r, g, b, a);
+    }
+
+    curve_colors.finish();
+
+    CLOG_INFO(&LOG,
+              "Loaded per-curve colors for %d curves (domain: Curve, format: Scene Linear RGBA)",
               curve_geom.num_curves());
   }
 
