@@ -209,15 +209,28 @@ static Curves *evaluate_curves_for_external_service(const Curves *input_curves, 
             input_geom.attributes().lookup<float>("radius"))
     {
       const VArray<float> &input_radii = input_radii_reader->varray;
-      bke::SpanAttributeWriter<float> output_radii =
-          output_geom.attributes_for_write().lookup_or_add_for_write_span<float>(
-              "radius", bke::AttrDomain::Point);
 
-      /* Materialize VArray to span for copying */
-      for (const int i : output_radii.span.index_range()) {
-        output_radii.span[i] = input_radii[i];
+      /* Validate VArray is not empty and size matches */
+      if (input_radii.is_empty()) {
+        CLOG_WARN(&LOG, "Radius attribute VArray is empty, skipping radius copy");
       }
-      output_radii.finish();
+      else if (input_radii.size() != input_geom.point_num) {
+        CLOG_WARN(&LOG,
+                  "Radius attribute size mismatch: %d vs expected %d points, skipping radius copy",
+                  input_radii.size(),
+                  input_geom.point_num);
+      }
+      else {
+        bke::SpanAttributeWriter<float> output_radii =
+            output_geom.attributes_for_write().lookup_or_add_for_write_span<float>(
+                "radius", bke::AttrDomain::Point);
+
+        /* Materialize VArray to span for copying */
+        for (const int i : output_radii.span.index_range()) {
+          output_radii.span[i] = input_radii[i];
+        }
+        output_radii.finish();
+      }
     }
 
     return output_curves;
