@@ -35,12 +35,28 @@ class NODE_MT_geometry_node_GEO_GEMELL(node_add_menu.AddNodeMenu):
         # Add static Gemell nodes
         self.node_operator(layout, "GeometryNodeGemellYarn")
 
-        # Add external nodes from FabricDataLoaderAPI
-        # These are registered dynamically at startup from the external service manifest
-        try:
-            self.node_operator(layout, "gemell.yarn.generate_from_curve")
-        except:
-            pass  # Node not available yet or service not running
+        # Add all registered external nodes dynamically
+        # External nodes are registered by external services at startup
+        #
+        # TODO: This list should be dynamically populated from the registered nodes,
+        # not hardcoded. The node IDs should come from the C++ ExternalNodeServiceManager
+        # which already has this information from the manifest. We need to expose a way
+        # to query all registered external node IDs from Python (e.g., via RNA or a
+        # dedicated Python API). For now, we maintain this list manually.
+        # See: D:\bdev\GemellStudio\source\blender\blenkernel\BKE_node_external_service.hh
+        # get_registered_external_node_ids() method exists but isn't exposed to Python yet.
+        external_node_candidates = [
+            "gemell.yarn.generate_from_curve",
+            "gemell.yarn.generate_card_path",
+        ]
+
+        for node_id in external_node_candidates:
+            try:
+                # Check if the node type is registered
+                if bpy.types.Node.bl_rna_get_subclass(node_id):
+                    self.node_operator(layout, node_id)
+            except:
+                pass  # Node not registered yet or not available
 
         self.draw_assets_for_catalog(layout, self.bl_label)
 
