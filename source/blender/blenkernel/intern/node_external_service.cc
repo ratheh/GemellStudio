@@ -800,6 +800,21 @@ void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService
   CLOG_INFO(&LOG, "Completed node registration for service '%s'", service.manifest.service_name.c_str());
 }
 
+Vector<std::string> ExternalNodeServiceManager::get_registered_external_node_ids() const
+{
+  Vector<std::string> node_ids;
+
+  for (const std::unique_ptr<ExternalNodeService> &service : services_) {
+    if (service->nodes_registered) {
+      for (const ExternalNodeDefinition &node_def : service->nodes) {
+        node_ids.append(node_def.node_id);
+      }
+    }
+  }
+
+  return node_ids;
+}
+
 /** \} */
 
 }  // namespace blender::bke

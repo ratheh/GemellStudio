@@ -466,14 +466,17 @@ static std::string build_execute_request_json(
 
   /* Required protocol fields */
   request_dict.append_str("nodeId", node_id);
+  request_dict.append_str("nodeType", node_def.node_id);
   request_dict.append(std::string("create"), std::make_shared<BooleanValue>(create_session));
 
-  /* Input geometry descriptor */
-  auto input_dict = request_dict.append_dict("input");
-  input_dict->append_str("memoryId", input_memory_id);
-  input_dict->append_str("format", "protobuf_v1");
-  input_dict->append_str("schemaPackage", "gemell.geometry.v1");
-  input_dict->append_str("messageType", "GeometryData");
+  /* Input geometry descriptor (optional for parametric nodes) */
+  if (!input_memory_id.empty()) {
+    auto input_dict = request_dict.append_dict("input");
+    input_dict->append_str("memoryId", input_memory_id);
+    input_dict->append_str("format", "protobuf_v1");
+    input_dict->append_str("schemaPackage", "gemell.geometry.v1");
+    input_dict->append_str("messageType", "GeometryData");
+  }
 
   /* Extract node-specific parameters */
   for (const ExternalNodeSocket &input_socket : node_def.inputs) {
@@ -647,6 +650,7 @@ void execute_external_geometry_node(GeoNodeExecParams params)
   SharedMemoryGuard memory_guard(service_base_url);
 
   /* Extract input geometry (find first SOCK_GEOMETRY input) */
+  /* Note: Parametric nodes (like Yarn Card Generator) may not have geometry input */
   const ExternalNodeSocket *geometry_input_socket = nullptr;
   for (const ExternalNodeSocket &socket : node_def->inputs) {
     if (socket.socket_type == SOCK_GEOMETRY) {
@@ -655,44 +659,6 @@ void execute_external_geometry_node(GeoNodeExecParams params)
     }
   }
 
-  if (geometry_input_socket == nullptr) {
-    CLOG_ERROR(&LOG, "Node has no geometry input socket");
-    params.error_message_add(NodeWarningType::Error, "Node configuration error");
-    return;
-  }
-
-  const StringRef geom_socket_name = geometry_input_socket->name;
-
-  /* Extract input geometry (extract_input handles missing inputs) */
-  GeometrySet input_geom = params.extract_input<GeometrySet>(geom_socket_name);
-  const Curves *input_curves = input_geom.get_curves();
-
-  if (input_curves == nullptr) {
-    params.error_message_add(NodeWarningType::Error, "Input geometry must contain curves");
-    return;
-  }
-
-  CLOG_INFO(&LOG,
-            "Input curves: %d points, %d curves",
-            input_curves->geometry.point_num,
-            input_curves->geometry.curve_num);
-
-  /* Evaluate curves to dense point representation */
-  CLOG_INFO(&LOG, "Evaluating curves for external service");
-  Curves *evaluated_curves = evaluate_curves_for_external_service(input_curves, 32);
-  TemporaryCurvesGuard evaluated_curves_guard(evaluated_curves);
-
-  if (evaluated_curves == nullptr) {
-    CLOG_ERROR(&LOG, "Failed to evaluate input curves");
-    params.error_message_add(NodeWarningType::Error, "Failed to evaluate input curves");
-    return;
-  }
-
-  CLOG_INFO(&LOG,
-            "Evaluated curves: %d points, %d curves",
-            evaluated_curves->geometry.point_num,
-            evaluated_curves->geometry.curve_num);
-
   /* Generate unique node ID for this execution (session management) */
   /* TODO: Implement proper session reuse. For now, always create new session */
   std::string node_id = generate_unique_node_id();
@@ -700,19 +666,59 @@ void execute_external_geometry_node(GeoNodeExecParams params)
 
   CLOG_INFO(&LOG, "Creating new session with node ID: %s", node_id.c_str());
 
-  /* Serialize curves to protobuf and create shared memory */
-  CLOG_INFO(&LOG, "Creating shared memory for input curves");
-  const std::string input_memory_id = bke::protobuf::create_shared_memory_from_curves(evaluated_curves,
-                                                                             node_id);
+  /* Input memory ID (empty for parametric nodes without geometry input) */
+  std::string input_memory_id;
 
-  if (input_memory_id.empty()) {
-    CLOG_ERROR(&LOG, "Failed to create shared memory for input curves");
-    params.error_message_add(NodeWarningType::Error, "Failed to allocate shared memory");
-    return;
+  /* Only process geometry input if the node has a geometry input socket */
+  if (geometry_input_socket != nullptr) {
+    const StringRef geom_socket_name = geometry_input_socket->name;
+
+    /* Extract input geometry (extract_input handles missing inputs) */
+    GeometrySet input_geom = params.extract_input<GeometrySet>(geom_socket_name);
+    const Curves *input_curves = input_geom.get_curves();
+
+    if (input_curves == nullptr) {
+      params.error_message_add(NodeWarningType::Error, "Input geometry must contain curves");
+      return;
+    }
+
+    CLOG_INFO(&LOG,
+              "Input curves: %d points, %d curves",
+              input_curves->geometry.point_num,
+              input_curves->geometry.curve_num);
+
+    /* Evaluate curves to dense point representation */
+    CLOG_INFO(&LOG, "Evaluating curves for external service");
+    Curves *evaluated_curves = evaluate_curves_for_external_service(input_curves, 32);
+    TemporaryCurvesGuard evaluated_curves_guard(evaluated_curves);
+
+    if (evaluated_curves == nullptr) {
+      CLOG_ERROR(&LOG, "Failed to evaluate input curves");
+      params.error_message_add(NodeWarningType::Error, "Failed to evaluate input curves");
+      return;
+    }
+
+    CLOG_INFO(&LOG,
+              "Evaluated curves: %d points, %d curves",
+              evaluated_curves->geometry.point_num,
+              evaluated_curves->geometry.curve_num);
+
+    /* Serialize curves to protobuf and create shared memory */
+    CLOG_INFO(&LOG, "Creating shared memory for input curves");
+    input_memory_id = bke::protobuf::create_shared_memory_from_curves(evaluated_curves, node_id);
+
+    if (input_memory_id.empty()) {
+      CLOG_ERROR(&LOG, "Failed to create shared memory for input curves");
+      params.error_message_add(NodeWarningType::Error, "Failed to allocate shared memory");
+      return;
+    }
+
+    CLOG_INFO(&LOG, "Input shared memory created: %s", input_memory_id.c_str());
+    memory_guard.track(input_memory_id);
   }
-
-  CLOG_INFO(&LOG, "Input shared memory created: %s", input_memory_id.c_str());
-  memory_guard.track(input_memory_id);
+  else {
+    CLOG_INFO(&LOG, "Parametric node - no geometry input required");
+  }
 
   /* Build JSON request payload */
   CLOG_INFO(&LOG, "Building execution request");

@@ -238,6 +238,13 @@ class ExternalNodeServiceManager {
    */
   void register_all_pending_nodes();
 
+  /**
+   * Get IDs of all registered external nodes across all services.
+   * Returns a vector of node IDs (e.g., ["gemell.yarn.generate_from_curve", "gemell.yarn.generate_card_path"]).
+   * Used by Python UI code to dynamically populate the Add Node menu.
+   */
+  Vector<std::string> get_registered_external_node_ids() const;
+
  private:
   ExternalNodeServiceManager() = default;
   ~ExternalNodeServiceManager() = default;
