@@ -56,7 +56,11 @@ struct ExternalServiceManifest {
   Vector<std::string> launch_args;  /* Command line arguments */
   std::string api_protocol;         /* "http" */
   std::string api_host;             /* "127.0.0.1" */
-  int api_port;                     /* 0 for dynamic allocation */
+  int api_port;                     /* Actual port (discovered or assigned) */
+  int preferred_port;               /* Preferred port (0 = any available) */
+  int port_range_start;             /* Start of acceptable port range */
+  int port_range_end;               /* End of acceptable port range */
+  std::string port_file_path;       /* Path to port discovery file (may contain env vars) */
   std::string api_base_path;        /* "/api/v1/geonodes" */
   int startup_timeout_ms;
   std::string health_check_endpoint;

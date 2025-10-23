@@ -14,11 +14,22 @@
 #include "BKE_gem_external_service_process.hh"
 #include "BKE_node_external_service.hh"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <sstream>
 #include <thread>
 
 #include "CLG_log.h"
+
+#ifdef WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <signal.h>
+#endif
 
 #include "BKE_appdir.hh"
 
@@ -36,10 +47,278 @@ static CLG_LogRef LOG = {"bke.node_external_service"};
 namespace blender::bke {
 
 /* -------------------------------------------------------------------- */
+/** \name Port File Discovery Helpers
+ * \{ */
+
+/**
+ * Expand environment variables in port file path.
+ * Example: "%LOCALAPPDATA%/Gemell/..." -> "C:/Users/Name/AppData/Local/Gemell/..."
+ */
+static std::string expand_port_file_path(const std::string &path_template)
+{
+  std::string result = path_template;
+
+#ifdef WIN32
+  /* Replace %LOCALAPPDATA% */
+  if (result.find("%LOCALAPPDATA%") != std::string::npos) {
+    const char *localappdata = std::getenv("LOCALAPPDATA");
+    if (localappdata) {
+      size_t pos = result.find("%LOCALAPPDATA%");
+      result.replace(pos, 14, localappdata);
+    }
+  }
+#else
+  /* Replace ~ with home directory */
+  if (!result.empty() && result[0] == '~') {
+    const char *home = std::getenv("HOME");
+    if (home) {
+      result.replace(0, 1, home);
+    }
+  }
+#endif
+
+  /* Convert forward slashes to platform-specific */
+#ifdef WIN32
+  std::replace(result.begin(), result.end(), '/', '\\');
+#else
+  std::replace(result.begin(), result.end(), '/', '/');
+#endif
+
+  return result;
+}
+
+/**
+ * Port file information structure.
+ */
+struct PortFileInfo {
+  int port;
+  int pid;
+  std::string timestamp;
+  std::string service_name;
+  std::string version;
+};
+
+/**
+ * Parse port file JSON.
+ * Returns std::nullopt if file doesn't exist or is invalid.
+ */
+static std::optional<PortFileInfo> parse_port_file(const std::string &file_path)
+{
+  if (!BLI_exists(file_path.c_str())) {
+    return std::nullopt;
+  }
+
+  std::shared_ptr<io::serialize::Value> value = io::serialize::read_json_file(file_path);
+  if (!value) {
+    return std::nullopt;
+  }
+
+  const io::serialize::DictionaryValue *dict = value->as_dictionary_value();
+  if (!dict) {
+    return std::nullopt;
+  }
+
+  PortFileInfo info;
+
+  /* Port and PID are required */
+  if (auto port = dict->lookup_int("port")) {
+    info.port = int(*port);
+  }
+  else {
+    return std::nullopt;
+  }
+
+  if (auto pid = dict->lookup_int("pid")) {
+    info.pid = int(*pid);
+  }
+  else {
+    return std::nullopt;
+  }
+
+  /* Optional fields */
+  if (auto timestamp = dict->lookup_str("timestamp")) {
+    info.timestamp = std::string(*timestamp);
+  }
+  if (auto service_name = dict->lookup_str("service_name")) {
+    info.service_name = std::string(*service_name);
+  }
+  if (auto version = dict->lookup_str("version")) {
+    info.version = std::string(*version);
+  }
+
+  return info;
+}
+
+/**
+ * Check if a process is running (platform-specific).
+ */
+static bool is_process_running(int pid)
+{
+#ifdef WIN32
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process != NULL) {
+    DWORD exitCode;
+    bool running = GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE;
+    CloseHandle(process);
+    return running;
+  }
+  return false;
+#else
+  /* Send signal 0 to check if process exists without actually signaling it */
+  return kill(pid, 0) == 0;
+#endif
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Service Discovery
+ * \{ */
+
+/**
+ * Try to discover an already-running service instance.
+ * Returns true if found and connected successfully.
+ */
+static bool external_service_discover(ExternalNodeService &service)
+{
+  /* Check if manifest specifies a port file location */
+  if (service.manifest.port_file_path.empty()) {
+    CLOG_INFO(&LOG, "No port file path configured, skipping discovery");
+    return false;
+  }
+
+  /* Expand environment variables in path */
+  std::string port_file_path = expand_port_file_path(service.manifest.port_file_path);
+  CLOG_INFO(&LOG, "Checking for existing service at port file: %s", port_file_path.c_str());
+
+  /* Try to read port file */
+  std::optional<PortFileInfo> port_info = parse_port_file(port_file_path);
+  if (!port_info.has_value()) {
+    CLOG_INFO(&LOG, "Port file not found or invalid");
+    return false;
+  }
+
+  CLOG_INFO(&LOG,
+            "Port file indicates process %d on port %d",
+            port_info->pid,
+            port_info->port);
+
+  /* Verify process is still running */
+  if (!is_process_running(port_info->pid)) {
+    CLOG_INFO(&LOG,
+              "Process %d is not running, cleaning up stale port file",
+              port_info->pid);
+    BLI_delete(port_file_path.c_str(), false, false);
+    return false;
+  }
+
+  /* Build health check URL */
+  char health_url[512];
+  BLI_snprintf(health_url,
+               sizeof(health_url),
+               "%s://%s:%d%s%s",
+               service.manifest.api_protocol.c_str(),
+               service.manifest.api_host.c_str(),
+               port_info->port,
+               service.manifest.api_base_path.c_str(),
+               service.manifest.health_check_endpoint.c_str());
+
+  CLOG_INFO(&LOG, "Testing health endpoint: %s", health_url);
+
+  /* Test health endpoint */
+  http::HttpResponse response = http::http_get(health_url, 2000); /* 2 second timeout */
+
+  if (!response.success || response.status_code != 200) {
+    CLOG_INFO(&LOG, "Health check failed: HTTP %d", response.status_code);
+    return false;
+  }
+
+  /* Parse health response */
+  std::stringstream ss(response.body);
+  io::serialize::JsonFormatter formatter;
+  std::unique_ptr<io::serialize::Value> value = formatter.deserialize(ss);
+
+  if (!value) {
+    CLOG_WARN(&LOG, "Failed to parse health check response");
+    return false;
+  }
+
+  const io::serialize::DictionaryValue *dict = value->as_dictionary_value();
+  if (!dict) {
+    CLOG_WARN(&LOG, "Invalid health check response format");
+    return false;
+  }
+
+  /* Verify status is "healthy" */
+  if (auto status = dict->lookup_str("status")) {
+    if (*status != "healthy") {
+      CLOG_WARN(&LOG, "Service reported unhealthy status: %s", status->c_str());
+      return false;
+    }
+  }
+  else {
+    CLOG_WARN(&LOG, "Health check missing status field");
+    return false;
+  }
+
+  /* SUCCESS! Use the existing service */
+  char base_url[256];
+  BLI_snprintf(base_url,
+               sizeof(base_url),
+               "%s://%s:%d%s",
+               service.manifest.api_protocol.c_str(),
+               service.manifest.api_host.c_str(),
+               port_info->port,
+               service.manifest.api_base_path.c_str());
+
+  service.api_base_url = std::string(base_url);
+  service.manifest.api_port = port_info->port;
+  service.is_running = true;
+
+  CLOG_INFO(&LOG, "Successfully connected to existing service on port %d", port_info->port);
+
+  /* Query available nodes from the discovered service */
+  if (!external_service_query_nodes(service)) {
+    CLOG_WARN(&LOG, "Failed to query nodes from discovered service");
+    /* Don't fail discovery just because node query failed - service is still usable */
+  }
+
+  return true;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Process Lifecycle Implementation
  * \{ */
 
-bool external_service_launch(ExternalNodeService &service)
+/* Forward declaration of internal launch function */
+static bool external_service_launch(ExternalNodeService &service);
+
+/**
+ * Discover existing service or launch new instance.
+ * This is the main entry point for service connection.
+ */
+bool external_service_discover_or_launch(ExternalNodeService &service)
+{
+  CLOG_INFO(&LOG,
+            "Attempting to connect to service '%s'",
+            service.manifest.service_name.c_str());
+
+  /* STEP 1: Try to discover existing service */
+  if (external_service_discover(service)) {
+    return true;
+  }
+
+  /* STEP 2: No existing service found, launch new one */
+  CLOG_INFO(&LOG, "No existing service found, launching new instance");
+  return external_service_launch(service);
+}
+
+/**
+ * Launch service process (internal function, called by external_service_discover_or_launch).
+ */
+static bool external_service_launch(ExternalNodeService &service)
 {
   CLOG_INFO(&LOG,
             "Launching service '%s' (ID: %s)",
@@ -182,7 +461,7 @@ void external_service_auto_start_all(Vector<std::unique_ptr<ExternalNodeService>
                 "Auto-starting service '%s' (auto_start: true)",
                 service->manifest.service_name.c_str());
 
-      if (!external_service_launch(*service)) {
+      if (!external_service_discover_or_launch(*service)) {
         CLOG_ERROR(&LOG,
                    "Failed to auto-start service '%s'",
                    service->manifest.service_name.c_str());
@@ -292,7 +571,7 @@ bool external_service_wait_for_health(ExternalNodeService &service)
     elapsed_ms += delay_ms;
 
     /* Exponential backoff (double delay each time, max 1600ms) */
-    delay_ms = std::min(delay_ms * 2, 1600);
+    delay_ms = (std::min)(delay_ms * 2, 1600);
   }
 
   CLOG_WARN(&LOG, "Service health check timed out after %d ms", timeout_ms);
@@ -354,7 +633,7 @@ bool external_service_restart(ExternalNodeService &service)
 
   /* Exponential backoff delay: 1s, 2s, 4s, ... */
   int delay_seconds = 1 << (service.restart_count - 1); /* 2^(count-1) */
-  delay_seconds = std::min(delay_seconds, 8);           /* Cap at 8 seconds */
+  delay_seconds = (std::min)(delay_seconds, 8);         /* Cap at 8 seconds */
 
   CLOG_INFO(&LOG,
             "Restarting service '%s' (attempt %d/%d) after %d second delay",

@@ -398,8 +398,24 @@ bool ExternalNodeServiceManager::parse_manifest_from_json(
     if (auto host = api_dict->lookup_str("host")) {
       manifest.api_host = std::string(*host);
     }
-    if (auto port = api_dict->lookup_int("port")) {
+    /* Parse port_file_path for service discovery */
+    if (auto port_file = api_dict->lookup_str("port_file_path")) {
+      manifest.port_file_path = std::string(*port_file);
+    }
+    /* Parse preferred_port (with fallback to "port" for backward compatibility) */
+    if (auto preferred = api_dict->lookup_int("preferred_port")) {
+      manifest.preferred_port = int(*preferred);
+      manifest.api_port = int(*preferred);  /* Initialize api_port with preferred */
+    } else if (auto port = api_dict->lookup_int("port")) {
+      manifest.preferred_port = int(*port);
       manifest.api_port = int(*port);
+    }
+    /* Parse port range for dynamic port selection */
+    if (auto range_start = api_dict->lookup_int("port_range_start")) {
+      manifest.port_range_start = int(*range_start);
+    }
+    if (auto range_end = api_dict->lookup_int("port_range_end")) {
+      manifest.port_range_end = int(*range_end);
     }
     if (auto base_path = api_dict->lookup_str("base_path")) {
       manifest.api_base_path = std::string(*base_path);
@@ -508,7 +524,7 @@ bool ExternalNodeServiceManager::validate_manifest(const ExternalServiceManifest
 
 bool ExternalNodeServiceManager::launch_service(ExternalNodeService &service)
 {
-  return external_service_launch(service);
+  return external_service_discover_or_launch(service);
 }
 
 bool ExternalNodeServiceManager::shutdown_service(ExternalNodeService &service)
