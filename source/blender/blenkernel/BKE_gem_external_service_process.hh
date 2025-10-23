@@ -31,19 +31,30 @@ struct ExternalServiceManifest;
  * \{ */
 
 /**
- * Launch an external service process.
+ * Discover existing service or launch new instance.
  *
- * Steps:
+ * This is the main entry point for service connection. It implements the two-step process:
+ * 1. Service Discovery - Checks for already-running service via port file
+ * 2. Service Launch - Launches new instance if discovery fails
+ *
+ * Discovery Steps:
+ * 1. Reads port file (if port_file_path specified in manifest)
+ * 2. Verifies process is still running
+ * 3. Tests health endpoint
+ * 4. Queries available nodes
+ * 5. Returns true if existing service is usable
+ *
+ * Launch Steps (if discovery fails):
  * 1. Validates executable exists
  * 2. Substitutes variables in launch args ({port}, {temp}, {config_dir})
  * 3. Launches process using platform-specific APIs
  * 4. Waits for health check to succeed
  * 5. Marks service as running
  *
- * \param service: Service to launch
- * \return true if successfully launched and health check passed, false otherwise
+ * \param service: Service to discover or launch
+ * \return true if connected to existing service or successfully launched new one, false otherwise
  */
-bool external_service_launch(ExternalNodeService &service);
+bool external_service_discover_or_launch(ExternalNodeService &service);
 
 /**
  * Shutdown an external service process.

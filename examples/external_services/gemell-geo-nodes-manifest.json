@@ -21,7 +21,10 @@
     "api": {
       "protocol": "http",
       "host": "127.0.0.1",
-      "port": 8567,
+      "preferred_port": 8567,
+      "port_range_start": 8567,
+      "port_range_end": 8577,
+      "port_file_path": "%LOCALAPPDATA%/Gemell/FabricDataLoaderAPI.port",
       "base_path": "/api/v1/geonodes",
       "startup_timeout_ms": 10000,
       "health_check_endpoint": "/health"
