@@ -666,8 +666,9 @@ void release_shared_memory(const std::string &memory_id, const std::string &serv
     return;
   }
 
-  // Build JSON request body
-  std::string request_body = "{\"memory_id\":\"" + memory_id + "\"}";
+  // Build JSON request body with memoryIds array format
+  // Protocol: POST /api/v1/geonodes/memory/release expects {"memoryIds": ["id1", "id2"]}
+  std::string request_body = "{\"memoryIds\":[\"" + memory_id + "\"]}";
 
   // Send HTTP POST request
   std::string endpoint = service_url + "/api/v1/geonodes/memory/release";
