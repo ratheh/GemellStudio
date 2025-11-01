@@ -29,6 +29,7 @@
 #include "BLI_gem_http_client.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_string.h"
+#include "BLI_time.h"
 #include "BLI_uuid.h"
 
 #include "BKE_main.hh"
@@ -672,12 +673,30 @@ void execute_external_geometry_node(GeoNodeExecParams params)
     }
   }
 
-  /* Generate unique node ID for this execution (session management) */
-  /* TODO: Implement proper session reuse. For now, always create new session */
-  std::string node_id = generate_unique_node_id();
-  bool create_session = true;
+  /* Get or initialize storage for session persistence */
+  bke::ExternalNodeStorage *storage = static_cast<bke::ExternalNodeStorage *>(params.node().storage);
+  if (storage == nullptr) {
+    /* Storage not initialized - this shouldn't happen, but handle gracefully */
+    CLOG_ERROR(&LOG, "External node storage not initialized");
+    params.error_message_add(NodeWarningType::Error, "Internal error: node storage not initialized");
+    return;
+  }
 
-  CLOG_INFO(&LOG, "Creating new session with node ID: %s", node_id.c_str());
+  /* Session persistence logic */
+  std::string node_id;
+  bool create_session;
+
+  if (storage->session_initialized && storage->session_id[0] != '\0') {
+    /* Reuse existing session */
+    node_id = storage->session_id;
+    create_session = false;
+    CLOG_INFO(&LOG, "Reusing existing session: %s", node_id.c_str());
+  } else {
+    /* Create new session */
+    node_id = generate_unique_node_id();
+    create_session = true;
+    CLOG_INFO(&LOG, "Creating new session: %s", node_id.c_str());
+  }
 
   /* Input memory ID (empty for parametric nodes without geometry input) */
   std::string input_memory_id;
@@ -746,6 +765,37 @@ void execute_external_geometry_node(GeoNodeExecParams params)
 
   http::HttpResponse response = http::http_post(execute_url, request_json, 30000);  /* 30 second timeout */
 
+  /* Handle 404 errors (session timeout) by recreating session */
+  if (response.status_code == 404 && !create_session) {
+    CLOG_WARN(&LOG,
+              "Session %s not found (timeout after 30min inactivity), recreating...",
+              node_id.c_str());
+
+    /* Store old session ID for SSE reconnection */
+    std::string old_session_id = node_id;
+
+    /* Stop old SSE connection */
+    bke::ExternalNodeServiceManager &manager = bke::ExternalNodeServiceManager::get_instance();
+    manager.stop_sse_connection(old_session_id);
+    CLOG_INFO(&LOG, "Stopped SSE connection for old session: %s", old_session_id.c_str());
+
+    /* Generate new session ID and retry with create=true */
+    node_id = generate_unique_node_id();
+    create_session = true;
+
+    CLOG_INFO(&LOG, "Retrying with new session: %s", node_id.c_str());
+
+    /* Rebuild request JSON with new session ID and create=true */
+    const std::string retry_request_json = build_execute_request_json(
+        node_id, create_session, input_memory_id, *node_def, params);
+
+    /* Retry the request */
+    response = http::http_post(execute_url, retry_request_json, 30000);
+
+    /* Note: New SSE connection will be started after successful response parsing */
+  }
+
+  /* Handle other errors */
   if (!response.success || response.status_code != 200) {
     CLOG_ERROR(&LOG,
                "HTTP request failed: status=%d, error=%s",
@@ -782,6 +832,50 @@ void execute_external_geometry_node(GeoNodeExecParams params)
     params.error_message_add(NodeWarningType::Error, "Failed to parse service response");
     return;
   }
+
+  /* Update storage with session information from successful execution */
+  if (create_session) {
+    /* Store session ID and service ID */
+    STRNCPY(storage->session_id, node_id.c_str());
+    STRNCPY(storage->service_id, service->manifest.service_id.c_str());
+    storage->session_initialized = true;
+    CLOG_INFO(&LOG, "Stored service ID: %s", storage->service_id);
+
+    /* Extract documentSessionId if present (for nodes that support update events) */
+    const std::shared_ptr<Value> *doc_session_id_value = response_dict.lookup("documentSessionId");
+    if (doc_session_id_value != nullptr && *doc_session_id_value != nullptr && (*doc_session_id_value)->type() == eValueType::String) {
+      const StringValue *doc_session_id_str = static_cast<const StringValue *>((*doc_session_id_value).get());
+      STRNCPY(storage->document_session_id, doc_session_id_str->value().c_str());
+      CLOG_INFO(&LOG, "Stored document session ID: %s", storage->document_session_id);
+    }
+
+    /* Extract SSE stream URL if present */
+    const std::shared_ptr<Value> *sse_url_value = response_dict.lookup("sseStreamUrl");
+    if (sse_url_value != nullptr && *sse_url_value != nullptr && (*sse_url_value)->type() == eValueType::String) {
+      const StringValue *sse_url_str = static_cast<const StringValue *>((*sse_url_value).get());
+      STRNCPY(storage->sse_stream_url, sse_url_str->value().c_str());
+      CLOG_INFO(&LOG, "Stored SSE stream URL: %s", storage->sse_stream_url);
+    }
+
+    CLOG_INFO(&LOG, "Session stored for reuse: %s", storage->session_id);
+
+    /* Start SSE connection for update notifications (only for new sessions with SSE URL) */
+    if (storage->sse_stream_url[0] != '\0') {
+      bke::ExternalNodeServiceManager &manager = bke::ExternalNodeServiceManager::get_instance();
+      manager.start_sse_connection(
+          storage->session_id,
+          storage->sse_stream_url,
+          storage->service_id,
+          const_cast<bNode *>(&params.node()),
+          const_cast<bNodeTree *>(&params.node().owner_tree()));
+
+      CLOG_INFO(&LOG, "SSE connection started for session: %s (service: %s)",
+                storage->session_id, storage->service_id);
+    }
+  }
+
+  /* Update last execution time */
+  storage->last_execution_time = BLI_time_now_seconds();
 
   /* Track output memories for cleanup */
   for (const auto &[field_name, memory_id] : output_memory_ids) {

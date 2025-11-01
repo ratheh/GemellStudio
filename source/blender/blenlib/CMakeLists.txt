@@ -32,6 +32,8 @@ set(SRC
   intern/BLI_heap_simple.cc
   intern/gem_http_client_unix.cc
   intern/gem_http_client_win.cc
+  intern/gem_sse_client_unix.cc
+  intern/gem_sse_client_win.cc
   intern/BLI_kdopbvh.cc
   intern/BLI_linklist.cc
   intern/BLI_linklist_lockfree.cc
@@ -267,6 +269,7 @@ set(SRC
   BLI_heap.h
   BLI_heap_simple.h
   BLI_gem_http_client.hh
+  BLI_gem_sse_client.hh
   BLI_implicit_sharing.h
   BLI_implicit_sharing.hh
   BLI_implicit_sharing_ptr.hh
@@ -507,6 +510,17 @@ endif()
 if(UNIX AND NOT APPLE)
   list(APPEND LIB
     bf_intern_libc_compat
+  )
+endif()
+
+if(UNIX)
+  # libcurl is needed for SSE client on Unix/Linux/macOS
+  find_package(CURL REQUIRED)
+  list(APPEND INC_SYS
+    ${CURL_INCLUDE_DIRS}
+  )
+  list(APPEND LIB
+    ${CURL_LIBRARIES}
   )
 endif()
 
