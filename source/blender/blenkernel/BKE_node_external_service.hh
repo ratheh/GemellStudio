@@ -13,7 +13,9 @@
  * External services run as separate processes and communicate via REST API and shared memory.
  */
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -25,6 +27,10 @@ namespace blender::io::serialize {
 class DictionaryValue;
 class Value;
 }  // namespace blender::io::serialize
+
+/* Forward declarations for DNA types (global namespace) */
+struct bNode;
+struct bNodeTree;
 
 namespace blender::bke {
 
@@ -139,6 +145,44 @@ struct ExternalNodeDefinition {
 };
 
 /**
+ * Storage data for external node instances (stored in node->storage).
+ * Contains session state that persists across executions and file save/load.
+ * This enables session reuse and SSE connection stability.
+ */
+struct ExternalNodeStorage {
+  /** Primary session ID from first execution (for session reuse) */
+  char session_id[64];
+
+  /** Secondary session ID for nodes that support update events (optional) */
+  char document_session_id[64];
+
+  /** SSE stream URL path (e.g., "/api/v1/geonodes/nodes/{nodeId}/events") */
+  char sse_stream_url[256];
+
+  /** Service ID for this node (e.g., "gemell.geo.nodes") - used for SSE connection lookup */
+  char service_id[64];
+
+  /** Timestamp of last successful execution (seconds since epoch) */
+  double last_execution_time;
+
+  /** Whether session has been initialized */
+  bool session_initialized;
+
+  char _pad[7]; /* Padding for alignment */
+
+  ExternalNodeStorage()
+      : last_execution_time(0.0),
+        session_initialized(false)
+  {
+    session_id[0] = '\0';
+    document_session_id[0] = '\0';
+    sse_stream_url[0] = '\0';
+    service_id[0] = '\0';
+    memset(_pad, 0, sizeof(_pad));
+  }
+};
+
+/**
  * Runtime representation of an external service.
  * Contains the service manifest and runtime state.
  */
@@ -160,6 +204,55 @@ struct ExternalNodeService {
       : is_running(false), process_handle(nullptr), restart_count(0), nodes_registered(false)
   {
   }
+};
+
+/** \} */
+
+}  // namespace blender::bke
+
+/* -------------------------------------------------------------------- */
+/** \name SSE Connection (Forward Declarations)
+ * \{ */
+
+/**
+ * Forward declaration of SSE client (implementation in blenlib).
+ */
+namespace blender::sse {
+class SseClient;
+}
+
+namespace blender::bke {
+
+/**
+ * SSE connection state for an external node instance.
+ * Tracks the SSE connection and update flags for each node.
+ */
+struct ExternalNodeSseConnection {
+  /** SSE client handle */
+  std::unique_ptr<blender::sse::SseClient> client;
+
+  /** Node ID (session ID) */
+  std::string node_id;
+
+  /** Pointer to Blender node for invalidation (weak reference) */
+  ::bNode *node_ptr;
+
+  /** Pointer to node tree for invalidation (weak reference) */
+  ::bNodeTree *tree_ptr;
+
+  /** Flag set by SSE callback when update is needed (atomic for thread-safety) */
+  std::atomic<bool> requires_update;
+
+  ExternalNodeSseConnection();
+  ~ExternalNodeSseConnection();
+
+  /* Delete copy constructor and assignment to prevent issues with unique_ptr */
+  ExternalNodeSseConnection(const ExternalNodeSseConnection &) = delete;
+  ExternalNodeSseConnection &operator=(const ExternalNodeSseConnection &) = delete;
+
+  /* Allow move constructor and assignment (defined in .cc file due to unique_ptr<incomplete type>) */
+  ExternalNodeSseConnection(ExternalNodeSseConnection &&) noexcept;
+  ExternalNodeSseConnection &operator=(ExternalNodeSseConnection &&) noexcept;
 };
 
 /** \} */
@@ -249,9 +342,46 @@ class ExternalNodeServiceManager {
    */
   Vector<std::string> get_registered_external_node_ids() const;
 
+  /* -------------------------------------------------------------------- */
+  /** \name SSE Event Subscription
+   * \{ */
+
+  /**
+   * Start SSE connection for an external node.
+   * Called after successful node execution to subscribe to update events.
+   *
+   * \param node_id: Session ID from node execution
+   * \param sse_stream_url: SSE endpoint path (e.g., "/api/v1/geonodes/nodes/{nodeId}/events")
+   * \param service_id: Service ID (e.g., "gemell.geo.nodes") for correct service lookup
+   * \param node: Pointer to Blender node (weak reference)
+   * \param tree: Pointer to node tree (weak reference)
+   */
+  void start_sse_connection(const std::string &node_id,
+                             const std::string &sse_stream_url,
+                             const std::string &service_id,
+                             ::bNode *node,
+                             ::bNodeTree *tree);
+
+  /**
+   * Stop SSE connection for an external node.
+   * Called when node is deleted or session is recreated.
+   *
+   * \param node_id: Session ID to disconnect
+   */
+  void stop_sse_connection(const std::string &node_id);
+
+  /**
+   * Check all SSE connections and invalidate nodes that need updates.
+   * Called by timer callback (every 1 second) on main thread.
+   * Thread-safe - only accesses atomic flags set by SSE callbacks.
+   */
+  void check_and_invalidate_nodes();
+
+  /** \} */
+
  private:
   ExternalNodeServiceManager() = default;
-  ~ExternalNodeServiceManager() = default;
+  ~ExternalNodeServiceManager();  /* Defined in .cc file (PIMPL with unique_ptr<SseClient>) */
 
   /* Prevent copying */
   ExternalNodeServiceManager(const ExternalNodeServiceManager &) = delete;
@@ -312,9 +442,22 @@ class ExternalNodeServiceManager {
   /** Temporary storage for raw service pointers (for Span return) */
   mutable Vector<ExternalNodeService *> service_ptr_cache_;
 
+  /** SSE connection management */
+  Map<std::string, std::unique_ptr<ExternalNodeSseConnection>> sse_connections_;
+  std::mutex sse_connections_mutex_;
+
+  /** Timer UUID for SSE event checking */
+  uintptr_t sse_check_timer_uuid_{0};
+
   /** \} */
 };
 
 /** \} */
 
 }  // namespace blender::bke
+
+/* -------------------------------------------------------------------- */
+/** \name SSE Event Subscription (End of Header)
+ * \{ */
+
+/** \} */

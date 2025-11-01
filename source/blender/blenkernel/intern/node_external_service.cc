@@ -15,18 +15,30 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 
 #include "CLG_log.h"
 
 #include "BKE_appdir.hh"
+#include "BKE_global.hh"
+#include "BKE_main.hh"
 #include "BKE_node.hh"
+#include "BKE_node_tree_update.hh"
 
 #include "BLI_fileops.hh"
+#include "BLI_gem_sse_client.hh"
+#include "BLI_listbase.h"
 #include "BLI_map.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_serialize.hh"
 #include "BLI_string.h"
+#include "BLI_timer.h"
+#include "BLI_uuid.h"
 #include "BLI_vector.hh"
+
+#include "DEG_depsgraph.hh"
+
+#include "WM_api.hh"
 
 #include "NOD_geometry.hh"
 #include "NOD_geometry_exec.hh"
@@ -34,7 +46,10 @@
 #include "NOD_socket_declarations.hh"
 #include "NOD_socket_declarations_geometry.hh"
 
+#include "DNA_ID.h"
+#include "DNA_modifier_types.h"
 #include "DNA_node_types.h"
+#include "DNA_object_types.h"
 
 #include "RNA_access.hh"
 #include "RNA_define.hh"
@@ -94,6 +109,12 @@ ExternalNodeServiceManager &ExternalNodeServiceManager::get_instance()
   return instance;
 }
 
+/* Destructor must be defined in .cc file where SseClient is complete (PIMPL with unique_ptr) */
+ExternalNodeServiceManager::~ExternalNodeServiceManager()
+{
+  /* cleanup() is called before this destructor, so members are already cleaned up */
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -128,24 +149,68 @@ void ExternalNodeServiceManager::discover_and_initialize()
 
   /* Auto-start services if configured (delegates to process helper) */
   external_service_auto_start_all(services_);
+
+  /* Register timer for SSE event checking (runs every 1 second) */
+  sse_check_timer_uuid_ = reinterpret_cast<uintptr_t>(this);
+  BLI_timer_register(
+      sse_check_timer_uuid_,
+      [](uintptr_t /*uuid*/, void *user_data) -> double {
+        ExternalNodeServiceManager *manager = static_cast<ExternalNodeServiceManager *>(user_data);
+        manager->check_and_invalidate_nodes();
+        return 1.0;  /* Call again in 1 second */
+      },
+      this,
+      nullptr,  /* No free function needed (singleton) */
+      1.0,      /* First check after 1 second */
+      true);    /* Persistent */
+
+  CLOG_INFO(&LOG, "SSE event check timer registered");
 }
 
 void ExternalNodeServiceManager::cleanup()
 {
+  /* Unregister SSE check timer */
+  if (sse_check_timer_uuid_ != 0) {
+    BLI_timer_unregister(sse_check_timer_uuid_);
+    sse_check_timer_uuid_ = 0;
+    CLOG_INFO(&LOG, "SSE event check timer unregistered");
+  }
+
+  /* Clear SSE connections (destructors will handle disconnect automatically)
+   * IMPORTANT: Do NOT manually call disconnect() here - it will be called by
+   * ~SseClient() destructors when unique_ptrs are destroyed. Double-disconnect
+   * causes crash at INVALID_HANDLE_VALUE (0xFFFFFFFFFFFFFFFF). */
+  {
+    std::lock_guard<std::mutex> lock(sse_connections_mutex_);
+    sse_connections_.clear();
+    CLOG_INFO(&LOG, "All SSE connections closed");
+  }
+
   /* Shutdown all running services (delegates to process helper) */
   external_service_shutdown_all(services_);
 
   /* Unregister and free dynamically allocated node types */
   CLOG_INFO(&LOG, "Unregistering %d external node type(s)...", int(g_external_node_types.size()));
+  int index = 0;
   for (bke::bNodeType *ntype : g_external_node_types) {
     if (ntype) {
+      CLOG_INFO(&LOG, "  [%d] Unregistering node type: idname='%s', ui_name='%s'",
+                index, ntype->idname.c_str(), ntype->ui_name.c_str());
+
       /* Unregister the node type from Blender's node system */
+      CLOG_INFO(&LOG, "  [%d] Calling node_unregister_type...", index);
       node_unregister_type(*ntype);
+      CLOG_INFO(&LOG, "  [%d] node_unregister_type completed", index);
+
       /* Free the allocated node type */
+      CLOG_INFO(&LOG, "  [%d] Freeing node type memory...", index);
       MEM_delete(ntype);
+      CLOG_INFO(&LOG, "  [%d] Node type freed", index);
     }
+    index++;
   }
   g_external_node_types.clear();
+  CLOG_INFO(&LOG, "All node types unregistered successfully");
 
   /* Note: We don't manually free RNA structs - Blender's RNA system manages their lifecycle.
    * Attempting to free them here causes "freed while holding a Python reference" warnings. */
@@ -155,11 +220,14 @@ void ExternalNodeServiceManager::cleanup()
   g_external_node_rna_structs.clear();
 
   /* Release resources */
+  CLOG_INFO(&LOG, "Clearing services vector...");
   services_.clear();
+  CLOG_INFO(&LOG, "Clearing service map...");
   service_map_.clear();
+  CLOG_INFO(&LOG, "Clearing service pointer cache...");
   service_ptr_cache_.clear();
 
-  CLOG_INFO(&LOG, "External Node Service Manager cleaned up");
+  CLOG_INFO(&LOG, "External Node Service Manager cleanup completed successfully");
 }
 
 Span<ExternalNodeService *> ExternalNodeServiceManager::get_services() const
@@ -548,6 +616,70 @@ void ExternalNodeServiceManager::check_service_health()
 /** \name Node Registration
  * \{ */
 
+/* -------------------------------------------------------------------- */
+/** \name External Node Storage Management
+ * \{ */
+
+/**
+ * Initialize storage for external node.
+ * Called when node is created.
+ */
+static void external_node_init_storage(bNodeTree * /*ntree*/, bNode *node)
+{
+  ExternalNodeStorage *storage = MEM_new<ExternalNodeStorage>(__func__);
+  node->storage = storage;
+}
+
+/**
+ * Free storage for external node.
+ * Called when node is deleted.
+ */
+static void external_node_free_storage(bNode *node)
+{
+  if (node->storage) {
+    MEM_delete(static_cast<ExternalNodeStorage *>(node->storage));
+    node->storage = nullptr;
+  }
+}
+
+/**
+ * Copy storage for external node.
+ * Called when node is duplicated or loaded from .blend file.
+ *
+ * Note: ExternalNodeStorage is runtime-only (not serialized to DNA).
+ * When loading old .blend files, src_node->storage will be null.
+ */
+static void external_node_copy_storage(bNodeTree * /*tree*/, bNode *dst_node, const bNode *src_node)
+{
+  const ExternalNodeStorage *src_storage = static_cast<const ExternalNodeStorage *>(src_node->storage);
+
+  /* Handle case where source storage is null (e.g., loading old .blend files).
+   * Since ExternalNodeStorage is not serialized to DNA (registered with empty struct name),
+   * nodes loaded from .blend files will have null storage until initfunc runs. */
+  if (src_storage == nullptr) {
+    /* Allocate fresh storage - initfunc will be called later to fully initialize */
+    dst_node->storage = MEM_new<ExternalNodeStorage>(__func__);
+    return;
+  }
+
+  /* Copy existing storage and reset session state for copied node */
+  ExternalNodeStorage *dst_storage = MEM_dupallocN<ExternalNodeStorage>(__func__, *src_storage);
+  dst_node->storage = dst_storage;
+
+  /* Reset session state for copied node - it should create its own session */
+  dst_storage->session_initialized = false;
+  dst_storage->session_id[0] = '\0';
+  dst_storage->document_session_id[0] = '\0';
+  dst_storage->sse_stream_url[0] = '\0';
+  dst_storage->last_execution_time = 0.0;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name External Node Declaration
+ * \{ */
+
 /**
  * Build node declaration (sockets) from external node definition.
  */
@@ -731,10 +863,7 @@ void ExternalNodeServiceManager::register_all_pending_nodes()
 
   for (const std::unique_ptr<ExternalNodeService> &service : services_) {
     if (!service->nodes_registered && !service->nodes.is_empty()) {
-      CLOG_INFO(&LOG,
-                "Registering %d node(s) from service '%s'",
-                service->nodes.size(),
-                service->manifest.service_name.c_str());
+      /* register_nodes_from_service will log its own message */
       register_nodes_from_service(*service);
     }
   }
@@ -765,19 +894,24 @@ void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService
     /* This sets default values, poll functions, and generates a unique legacy type */
     CLOG_INFO(&LOG, "    Calling node_type_base with NODE_CUSTOM...");
     node_type_base(*ntype, node_def.node_id, NODE_CUSTOM);
-    CLOG_INFO(&LOG, "    node_type_base completed");
+    CLOG_INFO(&LOG, "    node_type_base completed, idname='%s'", ntype->idname.c_str());
 
     /* Create RNA struct for this node type (required by node_register_type) */
     /* We need to allocate the RNA struct dynamically for external nodes */
-    CLOG_INFO(&LOG, "    Creating RNA struct...");
+    /* Each node gets its own RNA struct with a name matching the node ID */
+    CLOG_INFO(&LOG, "    Creating RNA struct with name '%s'...", node_def.node_id.c_str());
     StructRNA *srna = RNA_def_struct_ptr(&BLENDER_RNA, node_def.node_id.c_str(), &RNA_Node);
     if (srna) {
       ntype->rna_ext.srna = srna;
       RNA_def_struct_ui_text(srna, node_def.name.c_str(), node_def.description.c_str());
       RNA_def_struct_sdna(srna, "bNode");
+
+      /* CRITICAL: Establish bidirectional link between RNA struct and bNodeType */
+      /* This allows Blender to find the node type when loading .blend files */
+      RNA_struct_blender_type_set(srna, ntype);
+
       /* Store the RNA struct for cleanup later */
       g_external_node_rna_structs.append(srna);
-      /* Note: Icon will be set to default geometry node icon by the UI system */
       CLOG_INFO(&LOG, "    RNA struct created successfully");
     }
     else {
@@ -797,6 +931,15 @@ void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService
     /* Set our custom functions */
     ntype->declare = external_node_declare_wrapper;
     ntype->geometry_node_execute = external_node_execute_wrapper;
+
+    /* Register storage management functions */
+    /* Note: We don't pass a struct name because ExternalNodeStorage is not a DNA struct */
+    /* It's runtime-only storage managed by our init/free/copy functions */
+    node_type_storage(*ntype,
+                      "",  /* Empty string = no DNA serialization */
+                      external_node_free_storage,
+                      external_node_copy_storage);
+    ntype->initfunc = external_node_init_storage;
 
     /* Register the node type with Blender's node system */
     CLOG_INFO(&LOG, "    Calling node_register_type...");
@@ -829,6 +972,221 @@ Vector<std::string> ExternalNodeServiceManager::get_registered_external_node_ids
   }
 
   return node_ids;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name SSE Event Subscription
+ * \{ */
+
+/* ExternalNodeSseConnection constructor and destructor implementations */
+ExternalNodeSseConnection::ExternalNodeSseConnection()
+    : node_ptr(nullptr), tree_ptr(nullptr), requires_update(false)
+{
+}
+
+/* Destructor must be defined in .cc file where SseClient is complete (PIMPL with unique_ptr) */
+ExternalNodeSseConnection::~ExternalNodeSseConnection()
+{
+}
+
+/* Move constructor - manually implemented because std::atomic<bool> cannot be moved with = default */
+ExternalNodeSseConnection::ExternalNodeSseConnection(ExternalNodeSseConnection &&other) noexcept
+    : client(std::move(other.client)),
+      node_id(std::move(other.node_id)),
+      node_ptr(other.node_ptr),
+      tree_ptr(other.tree_ptr),
+      requires_update(other.requires_update.load())
+{
+  other.node_ptr = nullptr;
+  other.tree_ptr = nullptr;
+  other.requires_update.store(false);
+}
+
+/* Move assignment - manually implemented because std::atomic<bool> cannot be moved with = default */
+ExternalNodeSseConnection &ExternalNodeSseConnection::operator=(ExternalNodeSseConnection &&other) noexcept
+{
+  if (this != &other) {
+    client = std::move(other.client);
+    node_id = std::move(other.node_id);
+    node_ptr = other.node_ptr;
+    tree_ptr = other.tree_ptr;
+    requires_update.store(other.requires_update.load());
+
+    other.node_ptr = nullptr;
+    other.tree_ptr = nullptr;
+    other.requires_update.store(false);
+  }
+  return *this;
+}
+
+void ExternalNodeServiceManager::start_sse_connection(const std::string &node_id,
+                                                        const std::string &sse_stream_url,
+                                                        const std::string &service_id,
+                                                        ::bNode *node,
+                                                        ::bNodeTree *tree)
+{
+  std::lock_guard<std::mutex> lock(sse_connections_mutex_);
+
+  /* Find service by service_id */
+  ExternalNodeService *service = find_service(service_id);
+  if (service == nullptr) {
+    CLOG_WARN(&LOG, "Service '%s' not found for SSE connection", service_id.c_str());
+    return;
+  }
+
+  /* Extract protocol+host+port from api_base_url */
+  /* api_base_url is like "http://127.0.0.1:8567/api/v1/geonodes" */
+  /* We need just "http://127.0.0.1:8567" because sse_stream_url already has the full path */
+  std::string api_base_url = service->api_base_url;
+
+  /* Find the third slash (after "http://") to extract protocol+host+port */
+  size_t protocol_end = api_base_url.find("://");
+  std::string protocol_and_host;
+  if (protocol_end != std::string::npos) {
+    size_t path_start = api_base_url.find('/', protocol_end + 3);
+    if (path_start != std::string::npos) {
+      protocol_and_host = api_base_url.substr(0, path_start);
+    } else {
+      protocol_and_host = api_base_url;  /* No path, entire URL is protocol+host */
+    }
+  } else {
+    protocol_and_host = api_base_url;  /* Fallback */
+  }
+
+  std::string full_url = protocol_and_host + sse_stream_url;
+
+  CLOG_INFO(&LOG, "Starting SSE connection for node %s: %s", node_id.c_str(), full_url.c_str());
+
+  /* Create connection object */
+  auto connection = std::make_unique<ExternalNodeSseConnection>();
+  connection->node_id = node_id;
+  connection->node_ptr = node;
+  connection->tree_ptr = tree;
+
+  /* Event callback (runs on background thread) */
+  auto event_callback = [node_id, this](const sse::SseEvent &event) {
+    /* Log all SSE events for debugging */
+    CLOG_INFO(&LOG,
+              "SSE event received for node %s: type='%s' requiresReexecution=%d data='%s'",
+              node_id.c_str(),
+              event.event_type.c_str(),
+              event.requires_reexecution,
+              event.data.c_str());
+
+    /* Check if this event requires re-execution.
+     * Protocol: SSE events use "event: geonode" header with JSON payload containing
+     * "type" field (nodeDataChanged, nodeError, etc.) and "requiresReexecution" boolean.
+     * See Protocol-External-Geometry-Nodes.md section 3.4 for full specification. */
+    if (event.requires_reexecution) {
+      /* Set flag for invalidation (thread-safe atomic operation) */
+      std::lock_guard<std::mutex> cb_lock(sse_connections_mutex_);
+      std::unique_ptr<ExternalNodeSseConnection> *conn_ptr = sse_connections_.lookup_ptr(node_id);
+      if (conn_ptr && *conn_ptr) {
+        (*conn_ptr)->requires_update = true;
+        CLOG_INFO(&LOG, "Marking node %s for re-execution (event type: %s)",
+                  node_id.c_str(), event.event_type.c_str());
+      }
+    }
+  };
+
+  /* Error callback */
+  auto error_callback = [node_id](const std::string &error) {
+    CLOG_WARN(&LOG, "SSE error for node %s: %s", node_id.c_str(), error.c_str());
+  };
+
+  /* Connect SSE client */
+  connection->client = sse::SseClient::connect(full_url, event_callback, error_callback);
+
+  if (connection->client) {
+    /* Store connection */
+    sse_connections_.add_new(node_id, std::move(connection));
+    CLOG_INFO(&LOG, "SSE connection established for node %s", node_id.c_str());
+  }
+  else {
+    CLOG_ERROR(&LOG, "Failed to establish SSE connection for node %s", node_id.c_str());
+  }
+}
+
+void ExternalNodeServiceManager::stop_sse_connection(const std::string &node_id)
+{
+  std::lock_guard<std::mutex> lock(sse_connections_mutex_);
+
+  std::unique_ptr<ExternalNodeSseConnection> *conn_ptr = sse_connections_.lookup_ptr(node_id);
+  if (conn_ptr && *conn_ptr) {
+    if ((*conn_ptr)->client) {
+      (*conn_ptr)->client->disconnect();
+    }
+    sse_connections_.remove(node_id);
+    CLOG_INFO(&LOG, "Stopped SSE connection for node %s", node_id.c_str());
+  }
+}
+
+void ExternalNodeServiceManager::check_and_invalidate_nodes()
+{
+  std::lock_guard<std::mutex> lock(sse_connections_mutex_);
+
+  for (auto item : sse_connections_.items()) {
+    const std::string &node_id = item.key;
+    std::unique_ptr<ExternalNodeSseConnection> &connection = item.value;
+
+    if (connection->requires_update) {
+      /* Invalidate objects using this node tree (triggers geometry re-execution)
+       *
+       * Key insight: Geometry nodes are evaluated as part of the object's modifier stack,
+       * NOT directly from the tree. Therefore, we must tag the OBJECTS, not the tree.
+       * Tagging the tree alone does not trigger modifier evaluation.
+       */
+      if (connection->tree_ptr) {
+        CLOG_INFO(&LOG, "Invalidating objects for node %s: tree_ptr=%p tree_id='%s'",
+                  node_id.c_str(),
+                  static_cast<void*>(connection->tree_ptr),
+                  connection->tree_ptr->id.name);
+
+        /* Tag all objects that use this node tree via Geometry Nodes modifiers.
+         * This is the ONLY action that actually triggers geometry node re-execution. */
+        int objects_tagged = 0;
+
+        if (!G_MAIN) {
+          CLOG_WARN(&LOG, "G_MAIN is NULL, cannot invalidate objects for node %s", node_id.c_str());
+        }
+        else {
+          /* Iterate through all objects */
+          LISTBASE_FOREACH (Object *, ob, &G_MAIN->objects) {
+            /* Check each Geometry Nodes modifier */
+            LISTBASE_FOREACH (ModifierData *, md, &ob->modifiers) {
+              if (md->type == eModifierType_Nodes) {
+                NodesModifierData *nmd = reinterpret_cast<NodesModifierData *>(md);
+
+                /* Check if this modifier uses our node tree.
+                 * IMPORTANT: Compare by tree NAME, not pointer! Objects use evaluated copies
+                 * of the original tree, so pointer comparison fails. Both the original tree
+                 * (connection->tree_ptr) and evaluated copy (nmd->node_group) have the same
+                 * ID name (e.g., "NTGeometry Nodes"). */
+                if (nmd->node_group &&
+                    strcmp(nmd->node_group->id.name, connection->tree_ptr->id.name) == 0) {
+                  /* Tag this object for re-evaluation (triggers modifier stack) */
+                  DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY);
+                  objects_tagged++;
+                }
+              }
+            }
+          }
+
+          CLOG_INFO(&LOG, "Tagged %d objects for re-evaluation (node %s)",
+                    objects_tagged, node_id.c_str());
+        }
+      }
+      else {
+        CLOG_WARN(&LOG, "Cannot invalidate node %s: tree_ptr is null",
+                  node_id.c_str());
+      }
+
+      /* Reset flag */
+      connection->requires_update = false;
+    }
+  }
 }
 
 /** \} */
