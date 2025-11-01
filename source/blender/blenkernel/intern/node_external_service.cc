@@ -198,19 +198,21 @@ void ExternalNodeServiceManager::cleanup()
                 index, ntype->idname.c_str(), ntype->ui_name.c_str());
 
       /* Unregister the node type from Blender's node system */
+      /* node_unregister_type calls defer_free_node_type which will handle freeing later */
       CLOG_INFO(&LOG, "  [%d] Calling node_unregister_type...", index);
       node_unregister_type(*ntype);
-      CLOG_INFO(&LOG, "  [%d] node_unregister_type completed", index);
+      CLOG_INFO(&LOG, "  [%d] node_unregister_type completed (memory will be freed via defer mechanism)", index);
 
-      /* Free the allocated node type */
-      CLOG_INFO(&LOG, "  [%d] Freeing node type memory...", index);
-      MEM_delete(ntype);
-      CLOG_INFO(&LOG, "  [%d] Node type freed", index);
+      /* DO NOT call MEM_delete(ntype) here! */
+      /* node_unregister_type() -> node_free_type() -> defer_free_node_type() */
+      /* already registered the node for deferred deletion. Deleting it here */
+      /* causes a double-free crash during static destruction (atexit). */
+      /* The defer mechanism will handle the cleanup properly. */
     }
     index++;
   }
   g_external_node_types.clear();
-  CLOG_INFO(&LOG, "All node types unregistered successfully");
+  CLOG_INFO(&LOG, "All node types unregistered successfully (deferred cleanup will complete during shutdown)");
 
   /* Note: We don't manually free RNA structs - Blender's RNA system manages their lifecycle.
    * Attempting to free them here causes "freed while holding a Python reference" warnings. */
@@ -940,6 +942,14 @@ void ExternalNodeServiceManager::register_nodes_from_service(ExternalNodeService
                       external_node_free_storage,
                       external_node_copy_storage);
     ntype->initfunc = external_node_init_storage;
+
+    /* Set up free_self for proper cleanup during shutdown */
+    /* This is called by defer_free_node_type during static destruction (atexit) */
+    /* IMPORTANT: This must NOT access GPU or other resources that may be destroyed */
+    ntype->free_self = [](bNodeType *ntype_to_free) {
+      /* Simply free the memory - no GPU access or complex cleanup */
+      MEM_delete(ntype_to_free);
+    };
 
     /* Register the node type with Blender's node system */
     CLOG_INFO(&LOG, "    Calling node_register_type...");
