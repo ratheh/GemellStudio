@@ -296,6 +296,7 @@ set(SRC
   intern/node_external_service.cc
   intern/gem_external_service_process.cc
   intern/gem_geometry_protobuf.cc
+  intern/gem_bundle_json.cc
   intern/node_runtime.cc
   intern/node_socket_value.cc
   intern/node_tree_dot_export.cc
@@ -540,6 +541,7 @@ set(SRC
   BKE_node_external_service.hh
   BKE_gem_external_service_process.hh
   BKE_gem_geometry_protobuf.hh
+  BKE_gem_bundle_json.hh
   BKE_node_legacy_types.hh
   BKE_node_runtime.hh
   BKE_node_socket_value.hh
