@@ -698,6 +698,9 @@ static int map_string_to_socket_type(blender::StringRef type_str)
   if (type_str == "SOCK_MATERIAL") {
     return SOCK_MATERIAL;
   }
+  if (type_str == "SOCK_BUNDLE") {
+    return SOCK_BUNDLE;
+  }
   return SOCK_CUSTOM;  /* Fallback for unknown types */
 }
 

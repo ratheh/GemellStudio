@@ -764,6 +764,13 @@ static void build_external_node_declaration(const ExternalNodeDefinition &node_d
         }
         break;
       }
+      case SOCK_BUNDLE: {
+        auto &socket = b.add_input<Bundle>(input.name.c_str());
+        if (!input.description.empty()) {
+          socket.description(input.description.c_str());
+        }
+        break;
+      }
       default:
         CLOG_WARN(&LOG, "Unsupported input socket type: %d", input.socket_type);
         break;
@@ -796,6 +803,13 @@ static void build_external_node_declaration(const ExternalNodeDefinition &node_d
       }
       case SOCK_VECTOR: {
         auto &socket = b.add_output<blender::nodes::decl::Vector>(output.name.c_str());
+        if (!output.description.empty()) {
+          socket.description(output.description.c_str());
+        }
+        break;
+      }
+      case SOCK_BUNDLE: {
+        auto &socket = b.add_output<Bundle>(output.name.c_str());
         if (!output.description.empty()) {
           socket.description(output.description.c_str());
         }

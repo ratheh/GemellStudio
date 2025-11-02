@@ -24,6 +24,7 @@
 #include "BKE_curves.hh"
 #include "BKE_gem_external_service_process.hh"
 #include "BKE_gem_geometry_protobuf.hh"
+#include "BKE_gem_bundle_json.hh"
 #include "BKE_node_external_service.hh"
 
 #include "BLI_gem_http_client.hh"
@@ -37,6 +38,7 @@
 #include "DNA_curves_types.h"
 
 #include "NOD_socket_search_link.hh"
+#include "NOD_geometry_nodes_bundle.hh"
 
 #include "BLI_serialize.hh"
 
@@ -447,6 +449,33 @@ static void extract_socket_value_to_json(GeoNodeExecParams &params,
         break;
       }
 
+      case SOCK_BUNDLE: {
+        /* Extract bundle and convert to JSON dictionary */
+        const nodes::BundlePtr bundle = params.extract_input<nodes::BundlePtr>(socket_name);
+        if (bundle && !bundle->is_empty()) {
+          std::shared_ptr<DictionaryValue> bundle_dict = bke::bundle::bundle_to_json_dict(bundle);
+          if (bundle_dict) {
+            request_dict.append(socket_identifier, bundle_dict);
+            CLOG_INFO(&LOG,
+                      "Parameter %s (bundle): %lld items",
+                      socket_identifier.data(),
+                      bundle->size());
+          }
+          else {
+            CLOG_WARN(&LOG,
+                      "Failed to convert bundle to JSON for parameter %s",
+                      socket_identifier.data());
+          }
+        }
+        else {
+          /* Empty bundle - send empty dictionary */
+          auto empty_dict = std::make_shared<DictionaryValue>();
+          request_dict.append(socket_identifier, empty_dict);
+          CLOG_INFO(&LOG, "Parameter %s (bundle): empty", socket_identifier.data());
+        }
+        break;
+      }
+
       default:
         CLOG_WARN(&LOG,
                   "Unsupported socket type %d for parameter %s",
@@ -505,11 +534,31 @@ static std::string build_execute_request_json(
   return ss.str();
 }
 
+// ============================================================================
+// Output Parsing Structures (Protocol v2.0)
+// ============================================================================
+
 /**
- * Parse output memory IDs from JSON response.
+ * Describes an output from external service (Protocol v2.0).
+ * Outputs can be either geometry (shared memory) or bundle (inline JSON).
+ */
+struct ExternalNodeOutput {
+  std::string identifier;  /* Socket identifier (e.g., "fiberCurves", "threadVariant") */
+  std::string format;      /* "protobuf_v1" or "bundle_json" */
+
+  /* For protobuf_v1 format */
+  std::string memory_id;
+
+  /* For bundle_json format */
+  const io::serialize::DictionaryValue *bundle_data = nullptr;
+};
+
+/**
+ * Parse outputs from JSON response (Protocol v2.0).
+ * Handles both geometry outputs (protobuf shared memory) and bundle outputs (inline JSON).
  */
 static bool parse_output_memory_descriptor(const io::serialize::DictionaryValue &response_dict,
-                                             Vector<std::pair<std::string, std::string>> &output_memory_ids)
+                                             Vector<ExternalNodeOutput> &outputs)
 {
   using namespace io::serialize;
 
@@ -522,35 +571,91 @@ static bool parse_output_memory_descriptor(const io::serialize::DictionaryValue 
     return false;
   }
 
-  /* Extract output object */
-  const DictionaryValue *output_dict = response_dict.lookup_dict("output");
-  if (output_dict == nullptr) {
-    CLOG_ERROR(&LOG, "Response missing 'output' object");
+  /* Extract outputs dictionary (Protocol v2.0) */
+  const DictionaryValue *outputs_dict = response_dict.lookup_dict("outputs");
+  if (outputs_dict == nullptr) {
+    CLOG_ERROR(&LOG, "Response missing 'outputs' dictionary (Protocol v2.0 required)");
     return false;
   }
 
-  /* Extract all memory ID fields from output */
-  /* The server returns field names like "curvesMemoryId", "materialsMemoryId", etc. */
-  for (const auto &item : output_dict->elements()) {
-    const std::string &key = item.first;
+  /* Iterate all outputs by socket identifier */
+  for (const auto &item : outputs_dict->elements()) {
+    const std::string &output_identifier = item.first;
+    const std::shared_ptr<Value> &output_value = item.second;
 
-    /* Check if this is a memory ID field (ends with "MemoryId") */
-    if (key.size() > 8 && key.substr(key.size() - 8) == "MemoryId") {
-      std::optional<StringRefNull> memory_id_opt = output_dict->lookup_str(key);
-      if (!memory_id_opt.has_value()) {
+    if (!output_value || output_value->type() != eValueType::Dictionary) {
+      CLOG_WARN(&LOG,
+                "Output '%s' is not a dictionary, skipping",
+                output_identifier.c_str());
+      continue;
+    }
+
+    const DictionaryValue *output_desc = output_value->as_dictionary_value();
+    if (!output_desc) {
+      continue;
+    }
+
+    /* Extract format field */
+    std::optional<StringRefNull> format_opt = output_desc->lookup_str("format");
+    if (!format_opt.has_value()) {
+      CLOG_WARN(&LOG,
+                "Output '%s' missing 'format' field, skipping",
+                output_identifier.c_str());
+      continue;
+    }
+
+    const std::string format = std::string(format_opt.value());
+
+    ExternalNodeOutput output;
+    output.identifier = output_identifier;
+    output.format = format;
+
+    /* Handle different output formats */
+    if (format == "protobuf_v1") {
+      /* Geometry output via shared memory */
+      std::optional<StringRefNull> memory_id_opt = output_desc->lookup_str("memoryId");
+      if (!memory_id_opt.has_value() || memory_id_opt.value().is_empty()) {
+        CLOG_WARN(&LOG,
+                  "Output '%s' (protobuf_v1) missing memoryId, skipping",
+                  output_identifier.c_str());
         continue;
       }
-      const std::string memory_id = std::string(memory_id_opt.value());
 
-      if (!memory_id.empty()) {
-        output_memory_ids.append({key, memory_id});
-        CLOG_INFO(&LOG, "Output %s: %s", key.c_str(), memory_id.c_str());
-      }
+      output.memory_id = std::string(memory_id_opt.value());
+      CLOG_INFO(&LOG,
+                "Output '%s' (geometry): memoryId=%s",
+                output_identifier.c_str(),
+                output.memory_id.c_str());
     }
+    else if (format == "bundle_json") {
+      /* Bundle output via inline JSON */
+      const DictionaryValue *bundle_dict = output_desc->lookup_dict("data");
+      if (!bundle_dict) {
+        CLOG_WARN(&LOG,
+                  "Output '%s' (bundle_json) missing 'data' dictionary, skipping",
+                  output_identifier.c_str());
+        continue;
+      }
+
+      output.bundle_data = bundle_dict;
+      CLOG_INFO(&LOG,
+                "Output '%s' (bundle): %lld fields",
+                output_identifier.c_str(),
+                int64_t(bundle_dict->elements().size()));
+    }
+    else {
+      CLOG_WARN(&LOG,
+                "Output '%s' has unsupported format '%s', skipping",
+                output_identifier.c_str(),
+                format.c_str());
+      continue;
+    }
+
+    outputs.append(output);
   }
 
-  if (output_memory_ids.is_empty()) {
-    CLOG_ERROR(&LOG, "No output memory IDs found in response");
+  if (outputs.is_empty()) {
+    CLOG_ERROR(&LOG, "No valid outputs found in response");
     return false;
   }
 
@@ -826,9 +931,9 @@ void execute_external_geometry_node(GeoNodeExecParams params)
 
   const DictionaryValue &response_dict = *static_cast<const DictionaryValue *>(response_value.get());
 
-  /* Extract output memory IDs */
-  Vector<std::pair<std::string, std::string>> output_memory_ids;
-  if (!parse_output_memory_descriptor(response_dict, output_memory_ids)) {
+  /* Parse outputs (Protocol v2.0) */
+  Vector<ExternalNodeOutput> outputs;
+  if (!parse_output_memory_descriptor(response_dict, outputs)) {
     params.error_message_add(NodeWarningType::Error, "Failed to parse service response");
     return;
   }
@@ -877,32 +982,107 @@ void execute_external_geometry_node(GeoNodeExecParams params)
   /* Update last execution time */
   storage->last_execution_time = BLI_time_now_seconds();
 
-  /* Track output memories for cleanup */
-  for (const auto &[field_name, memory_id] : output_memory_ids) {
-    memory_guard.track(memory_id);
-  }
-
-  /* Set output sockets */
-  /* Find the primary geometry output (first SOCK_GEOMETRY output) */
-  for (const ExternalNodeSocket &output_socket : node_def->outputs) {
-    if (output_socket.socket_type == SOCK_GEOMETRY) {
-      /* Find corresponding memory ID (look for first geometry-related memory ID) */
-      for (const auto &[field_name, memory_id] : output_memory_ids) {
-        /* Match primary curves output */
-        if (field_name.find("curves") != std::string::npos ||
-            field_name.find("Curves") != std::string::npos ||
-            field_name.find("geometry") != std::string::npos) {
-
-          set_geometry_output_socket(params, output_socket.name, memory_id);
-          break;
-        }
-      }
-      break;  /* Only handle first geometry output for now */
+  /* Track geometry output memories for cleanup */
+  for (const ExternalNodeOutput &output : outputs) {
+    if (output.format == "protobuf_v1" && !output.memory_id.empty()) {
+      memory_guard.track(output.memory_id);
     }
   }
 
-  /* TODO: Handle material profile output (SOCK_CUSTOM) */
-  /* TODO: Handle other output socket types */
+  /* Set output sockets by matching identifiers */
+  CLOG_INFO(&LOG, "Setting %zu output socket(s)", size_t(node_def->outputs.size()));
+
+  for (const ExternalNodeSocket &output_socket : node_def->outputs) {
+    CLOG_INFO(&LOG,
+              "Processing output socket '%s' (identifier: %s, type: %d)",
+              output_socket.name.c_str(),
+              output_socket.identifier.c_str(),
+              output_socket.socket_type);
+
+    /* Find matching output by identifier */
+    const ExternalNodeOutput *matching_output = nullptr;
+    for (const ExternalNodeOutput &output : outputs) {
+      if (output.identifier == output_socket.identifier) {
+        matching_output = &output;
+        break;
+      }
+    }
+
+    if (!matching_output) {
+      CLOG_WARN(&LOG,
+                "No output data found for socket '%s' (identifier: %s)",
+                output_socket.name.c_str(),
+                output_socket.identifier.c_str());
+      continue;
+    }
+
+    CLOG_INFO(&LOG,
+              "Found matching output for '%s': format=%s",
+              output_socket.name.c_str(),
+              matching_output->format.c_str());
+
+    /* Handle different socket types */
+    if (output_socket.socket_type == SOCK_GEOMETRY) {
+      /* Geometry output - read from shared memory */
+      if (matching_output->format == "protobuf_v1" && !matching_output->memory_id.empty()) {
+        set_geometry_output_socket(params, output_socket.name, matching_output->memory_id);
+      }
+      else {
+        CLOG_ERROR(&LOG,
+                   "Geometry socket '%s' requires protobuf_v1 format, got: %s",
+                   output_socket.name.c_str(),
+                   matching_output->format.c_str());
+      }
+    }
+    else if (output_socket.socket_type == SOCK_BUNDLE) {
+      /* Bundle output - convert from JSON */
+      CLOG_INFO(&LOG,
+                "Processing bundle output socket '%s' (identifier: %s)",
+                output_socket.name.c_str(),
+                output_socket.identifier.c_str());
+
+      if (matching_output->format == "bundle_json" && matching_output->bundle_data != nullptr) {
+        CLOG_INFO(&LOG, "Converting JSON to bundle for socket '%s'", output_socket.name.c_str());
+
+        nodes::BundlePtr bundle = bke::bundle::json_dict_to_bundle(*matching_output->bundle_data);
+
+        CLOG_INFO(&LOG,
+                  "JSON to bundle conversion completed for socket '%s', bundle is %s",
+                  output_socket.name.c_str(),
+                  bundle ? "valid" : "null");
+
+        if (bundle) {
+          CLOG_INFO(&LOG,
+                    "Calling params.set_output for socket '%s' with %lld items",
+                    output_socket.name.c_str(),
+                    bundle->size());
+
+          params.set_output(output_socket.name, std::move(bundle));
+
+          CLOG_INFO(&LOG,
+                    "Successfully set bundle output socket '%s'",
+                    output_socket.name.c_str());
+        }
+        else {
+          CLOG_ERROR(&LOG,
+                     "Failed to convert JSON to bundle for socket '%s'",
+                     output_socket.name.c_str());
+        }
+      }
+      else {
+        CLOG_ERROR(&LOG,
+                   "Bundle socket '%s' requires bundle_json format, got: %s",
+                   output_socket.name.c_str(),
+                   matching_output->format.c_str());
+      }
+    }
+    else {
+      CLOG_WARN(&LOG,
+                "Unsupported output socket type %d for '%s'",
+                output_socket.socket_type,
+                output_socket.name.c_str());
+    }
+  }
 
   const auto end_time = std::chrono::steady_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
